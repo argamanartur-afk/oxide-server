@@ -23,8 +23,8 @@ app.use(express.json());
 //  Можно также задать через переменные окружения TELEGRAM_BOT_TOKEN /
 //  TELEGRAM_BOT_USERNAME — это безопаснее, чем хранить токен в коде.
 // ════════════════════════════════════════════════════════════════
-const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN    || 'ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА';
-const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || 'ВСТАВЬТЕ_СЮДА_USERNAME_БОТА';
+const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN    || '8606129255:AAHsJI_AGFUQ910I7WQTxLJwAexVieDkAjI';
+const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || 'oxide_clumsy_2026_bot';
 const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID || 0; // Вставьте ID вашей Telegram-группы
 const TELEGRAM_GROUP_LINK = 'https://t.me/+Tu7sw6yGV_c5YzY6';
 const TELEGRAM_PURCHASE_CONTACT    = '@oxide_clumsy_admin';
