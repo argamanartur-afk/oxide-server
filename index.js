@@ -25,7 +25,7 @@ app.use(express.json());
 // ════════════════════════════════════════════════════════════════
 const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN    || '8606129255:AAHsJI_AGFUQ910I7WQTxLJwAexVieDkAjI';
 const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || 'oxide_clumsy_2026_bot';
-const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID || 0; // Вставьте ID вашей Telegram-группы
+const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID || -1003756285081;
 const TELEGRAM_GROUP_LINK = 'https://t.me/+Tu7sw6yGV_c5YzY6';
 const TELEGRAM_PURCHASE_CONTACT    = '@oxide_clumsy_admin';
 const TELEGRAM_PRICE_TEXT          = '100 Stars или 150 грн';
