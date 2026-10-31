@@ -32,7 +32,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 // Hard-fail: без пароля админа сервер не стартует.
 if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 16) {
     console.error('[FATAL] ADMIN_PASSWORD не задан или короче 16 символов.');
-    console.error('        Задайте его в env (Railway → Variables → ADMIN_PASSWORD).');
+    console.error('        Задайте его в env (Render → Environment → ADMIN_PASSWORD).');
     process.exit(1);
 }
 
@@ -81,8 +81,8 @@ const rlChatSend        = makeLimiter(1,   20,  '/chat/send');
 const rlRankSend        = makeLimiter(60,   5,  '/rank/send');
 const rlRankReport      = makeLimiter(60,  10,  '/rank/report');
 const rlHeartbeat       = makeLimiter(1,   60,  '/heartbeat');
-const rlEnumeration     = makeLimiter(1,   60,  'enumeration');   // /user/:login, /mute-status, /keys/check-*, /check-banned, /check-account-exists
-const rlTelegramPublic  = makeLimiter(1,   60,  'telegram-public'); // /telegram/poll-token, /keys/token-by-device, /telegram/check-token, /telegram/config
+const rlEnumeration     = makeLimiter(1,   60,  'enumeration');   
+const rlTelegramPublic  = makeLimiter(1,   60,  'telegram-public'); 
 const rlDelete          = makeLimiter(60,   5,  '/delete');
 const rlSupportSend     = makeLimiter(1,   30,  '/support/send');
 const rlSupportCreate   = makeLimiter(60,   5,  '/support/create');
@@ -128,7 +128,6 @@ function hashPassword(plain) {
 }
 
 // Проверка пароля с миграцией plaintext → bcrypt.
-// Возвращает { ok, migrated } — migrated=true означает, что надо сохранить users.
 function verifyPassword(plain, user) {
     if (!user || !plain) return { ok: false, migrated: false };
     if (user.passwordHash) {
@@ -347,7 +346,7 @@ function cleanupExpiredTelegramTokens() {
 }
 setInterval(cleanupExpiredTelegramTokens, 60 * 60 * 1000);
 
-// Обработчики бота — оставлены без изменений в логике.
+// Обработчики бота
 async function handleTelegramStart(message) {
     const chatId = message.chat.id;
     const from = message.from || {};
@@ -376,8 +375,6 @@ async function handleTelegramStart(message) {
 async function handleTelegramCallback(cq) {
     await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
     if (cq.data !== 'check_sub') return;
-    // Реализация — как в исходнике (проверка подписки + выдача токена).
-    // Упрощено для ответа — полная версия идентична старой.
     await handleTelegramCheckSub(cq.message.chat.id, cq.from || {});
 }
 
@@ -468,7 +465,6 @@ async function handleGetBotKey(message) {
             return;
         }
     }
-    // Генерация уникального ключа
     const generateKey = () => {
         const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
         let key = '';
@@ -789,17 +785,14 @@ function deactivatedUserMessage(entry) {
 //  ADMIN MIDDLEWARE
 // ═══════════════════════════════════════════════════════════════════════════
 function requireAdmin(req, res, next) {
-    // 1) Bearer token (новый путь)
     const auth = (req.headers['authorization'] || '').trim();
     if (auth.startsWith('Bearer ')) {
         if (isValidAdminSession(auth.slice(7))) return next();
         return res.status(403).json({ status: 'forbidden', message: 'Недействительный или просроченный токен' });
     }
-    // 2) Legacy: adminPassword в body (deprecated — для совместимости со старым APK)
     if (LEGACY_ADMIN_PASSWORD_ON) {
         const { adminLogin, adminPassword } = req.body || {};
         if (adminLogin === ADMIN_LOGIN && typeof adminPassword === 'string' && safeEqual(adminPassword, ADMIN_PASSWORD)) {
-            console.warn('[deprecated] Admin request via plaintext password. Обновите клиент на Bearer-токен.');
             return next();
         }
     }
@@ -929,7 +922,6 @@ app.post('/login', rlLogin, async (req, res) => {
                 if (!deviceId || !tg.verifiedDevices[deviceId]) return res.status(403).json({ status: 'telegram_required', message: 'Сначала привяжите Telegram.' });
             }
 
-            // Обновление TG-данных через getChat
             const tgLinks = loadTelegramLinks();
             const tgInfo = deviceId ? tgLinks.verifiedDevices[deviceId] : null;
             let tgPrevUsername = '', tgPrevFirstName = '';
@@ -1081,9 +1073,6 @@ app.post('/profile', rlLogin, async (req, res) => {
     });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  /delete — ТРЕБУЕТ ПАРОЛЬ (было — дыра)
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/delete', rlDelete, async (req, res) => {
     await withUsersLock(async () => {
         const { login, password } = req.body || {};
@@ -1100,9 +1089,6 @@ app.post('/delete', rlDelete, async (req, res) => {
     });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CHAT — на диске, с проверкой пароля
-// ═══════════════════════════════════════════════════════════════════════════
 const MAX_CHAT_MESSAGES = 500;
 
 app.post('/chat/send', rlChatSend, async (req, res) => {
@@ -1147,7 +1133,6 @@ app.post('/admin/chat/delete-messages', requireAdmin, (req, res) => {
     const idSet = new Set(messageIds);
     const chat = loadChat();
     const before = chat.messages.length;
-    // мутируем in-place — фикс TypeError на const
     const filtered = chat.messages.filter(m => !idSet.has(m.id));
     chat.messages.length = 0;
     chat.messages.push(...filtered);
@@ -1155,9 +1140,6 @@ app.post('/admin/chat/delete-messages', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', deleted: before - chat.messages.length });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  PUBLIC READ — enumeration, rate-limit
-// ═══════════════════════════════════════════════════════════════════════════
 app.get('/user/:login', rlEnumeration, (req, res) => {
     const { login } = req.params;
     if (login === ADMIN_LOGIN) return res.json({ status: 'ok', login: ADMIN_LOGIN, created_at: '2024-01-01T00:00:00.000Z', user_id: '000001', deleted: false, ban: null });
@@ -1180,9 +1162,6 @@ app.get('/mute-status/:login', rlEnumeration, (req, res) => {
     return res.json({ status: 'ok', muted: false });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  REPORTS
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/report', rlRankReport, (req, res) => {
     const { reporterLogin, targetLogin, messageText, messageId } = req.body || {};
     if (!reporterLogin || !targetLogin || !messageText) return res.status(400).json({ status: 'error', message: 'Не все поля' });
@@ -1244,9 +1223,6 @@ app.post('/admin/reports/unseen-count', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', count: data.reports.filter(r => !r.seen).length });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ADMIN LOGIN + STATS
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/admin/login', rlAdminLogin, (req, res) => {
     const { password } = req.body || {};
     if (!password || !safeEqual(password, ADMIN_PASSWORD)) return res.status(401).json({ status: 'wrong_password', message: 'Неверный пароль' });
@@ -1287,9 +1263,6 @@ app.get('/app-status', (req, res) => {
     return res.json({ appDisabled: state.appDisabled || false });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  BAN / MUTE
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/admin/ban', requireAdmin, async (req, res) => {
     await withUsersLock(async () => {
         const { targetLogin, days, reason } = req.body || {};
@@ -1426,9 +1399,6 @@ app.post('/admin/muted-list', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', users: list });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  SUPPORT
-// ═══════════════════════════════════════════════════════════════════════════
 function genChatId() { return 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10); }
 
 app.post('/support/chat/create', rlSupportCreate, (req, res) => {
@@ -1473,7 +1443,6 @@ app.post('/support/chats', (req, res) => {
     const cooldownUntil = (users[login] && users[login].supportCooldownUntil) || 0;
     const chats = [];
     for (const chat of Object.values(data.chats)) {
-            for (const chat of Object.values(data.chats)) {
         if (chat.userLogin !== login) continue;
         const msgs = chat.messages || [];
         const lastUserMsg = msgs.filter(m => m.sender === 'user' || m.sender === 'admin').slice(-1)[0];
@@ -1675,9 +1644,6 @@ app.post('/support/admin/check-new', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', newUserMsg });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  RANK SHARE — требует пароль
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/rank/send', rlRankSend, (req, res) => {
     const { login, password, createdAt, description, images } = req.body || {};
     if (!login || !password || !createdAt) return res.status(400).json({ error: 'Missing login/password/createdAt' });
@@ -1804,9 +1770,6 @@ app.post('/admin/rank/mute-from-report', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', message: 'Мут в разделе Звания выдан' });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  KEY SYSTEM
-// ═══════════════════════════════════════════════════════════════════════════
 function generateKey() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let key = '';
@@ -1902,7 +1865,6 @@ app.post('/admin/keys/list', requireAdmin, (req, res) => {
 app.post('/admin/keys/delete', requireAdmin, (req, res) => {
     const { key, reason } = req.body || {};
     if (!key) return res.status(400).json({ status: 'error', message: 'Укажите ключ' });
-    // ФИКС: reason может быть undefined → старый код падал на .trim()
     const safeReason = (reason || '').trim();
 
     const data = loadKeys();
@@ -2148,7 +2110,6 @@ app.post('/keys/update-user', rlKeysUpdateUser, async (req, res) => {
         const { key, deviceId, login, userId } = req.body || {};
         if (!key || !deviceId) return res.status(400).json({ status: 'error' });
 
-        // ФИКС: проверяем что логин реально существует (нельзя привязать чужой/выдуманный)
         if (login) {
             const users = loadUsers();
             if (!users[login]) return res.status(404).json({ status: 'error', message: 'Пользователь не найден' });
@@ -2202,9 +2163,6 @@ app.post('/keys/update-user', rlKeysUpdateUser, async (req, res) => {
     });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  BOT KEYS — фикс: deviceId должен принадлежать пользователю
-// ═══════════════════════════════════════════════════════════════════════════
 app.post('/bot/keys/list', (req, res) => {
     const { login, password, deviceId } = req.body || {};
     if (!login || !password || !deviceId) return res.json({ status: 'error', keys: [] });
@@ -2212,9 +2170,6 @@ app.post('/bot/keys/list', (req, res) => {
     const u = users[login];
     if (!u || !verifyPassword(password, u).ok) return res.json({ status: 'error', keys: [] });
 
-    // ФИКС: проверяем что deviceId принадлежит именно этому пользователю
-    // (u.telegram.id === verifiedDevices[deviceId].telegramId). Без этой проверки
-    // любой мог указать чужой deviceId и увидеть чужие bot-ключи.
     const tgLinks = loadTelegramLinks();
     const vd = tgLinks.verifiedDevices[deviceId];
     if (!vd || !vd.telegramId) return res.json({ status: 'ok', keys: [] });
@@ -2299,9 +2254,6 @@ app.post('/admin/bot/keys/list', requireAdmin, (req, res) => {
     return res.json({ status: 'ok', keys: result });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ERROR HANDLER + START
-// ═══════════════════════════════════════════════════════════════════════════
 app.use((err, req, res, next) => {
     console.error('[uncaught]', err);
     if (res.headersSent) return next(err);
