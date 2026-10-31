@@ -57,7 +57,7 @@ const rlSupportCreate   = makeLimiter(60,   5,  '/support/create');
 // ═══════════════════════════════════════════════════════════════════════════
 //  MONGODB DATABASE SETUP & CACHE
 // ═══════════════════════════════════════════════════════════════════════════
-const mongoClient = new MongoClient(process.env.MONGODB_URI || '');
+const mongoClient = new MongoClient(process.env.MONGODB_URI || '', { autoSelectFamily: false });
 let mongoDb = null;
 let dbCache = {}; // Кэш в памяти для мгновенной работы
 
