@@ -43,7 +43,7 @@ const rlDelete = makeLimiter(60, 5, '/delete');
 const rlSupportSend = makeLimiter(1, 30, '/support/send');
 const rlSupportCreate = makeLimiter(60, 5, '/support/create');
 
-const mongoClient = new MongoClient(process.env.MONGODB_URI || '', { autoSelectFamily: false });
+const mongoClient = new MongoClient(process.env.MONGODB_URI || '');
 let mongoDb = null;
 let dbCache = {};
 
