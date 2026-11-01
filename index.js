@@ -5,336 +5,185 @@ const bcrypt    = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 const { MongoClient } = require('mongodb');
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  СЕКРЕТЫ — ТОЛЬКО ИЗ ENV.
-// ═══════════════════════════════════════════════════════════════════════════
-const PORT                       = process.env.PORT || 3000;
-const ADMIN_LOGIN                = 'admin';
-const ADMIN_PASSWORD             = process.env.ADMIN_PASSWORD || '';
-const LEGACY_ADMIN_PASSWORD_ON   = process.env.LEGACY_ADMIN_PASSWORD !== 'false';
+const PORT = process.env.PORT || 3000;
+const ADMIN_LOGIN = 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const LEGACY_ADMIN_PASSWORD_ON = process.env.LEGACY_ADMIN_PASSWORD !== 'false';
 
 const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN    || '';
 const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
 const TELEGRAM_GROUP_ID     = process.env.TELEGRAM_GROUP_ID || -1003756285081;
 const TELEGRAM_GROUP_LINK   = 'https://t.me/+Tu7sw6yGV_c5YzY6';
-const TELEGRAM_PURCHASE_CONTACT    = '@dsoci';
-const TELEGRAM_PRICE_TEXT          = '25 Stars или 50 грн';
-const TELEGRAM_TOKEN_TTL_MS        = 15 * 60 * 1000;
+const TELEGRAM_PURCHASE_CONTACT = '@dsoci';
+const TELEGRAM_PRICE_TEXT = '25 Stars или 50 грн';
+const TELEGRAM_TOKEN_TTL_MS = 15 * 60 * 1000;
 const TELEGRAM_DISPLAY_TZ_OFFSET_MIN = process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN ? parseInt(process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN, 10) : 180;
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 16) {
-    console.error('[FATAL] ADMIN_PASSWORD не задан или короче 16 символов.');
-    process.exit(1);
-}
+if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 16) { console.error('[FATAL] ADMIN_PASSWORD не задан или короче 16 символов.'); process.exit(1); }
 
 const app = express();
 app.use(cors({ origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : false, credentials: false }));
 app.use(express.json({ limit: '30mb' }));
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  RATE LIMITERS
-// ═══════════════════════════════════════════════════════════════════════════
-function makeLimiter(windowMin, max, label) {
-    return rateLimit({ windowMs: windowMin * 60 * 1000, max, standardHeaders: true, legacyHeaders: false, message: { status: 'error', message: `Слишком много запросов (${label}).` } });
-}
-const rlLogin           = makeLimiter(15,  10,  '/login');
-const rlRegister        = makeLimiter(60,   5,  '/register');
-const rlAdminLogin      = makeLimiter(15,   5,  '/admin/login');
-const rlKeysValidate    = makeLimiter(1,   30,  '/keys/validate');
-const rlKeysUpdateUser  = makeLimiter(1,   30,  '/keys/update-user');
-const rlChatSend        = makeLimiter(1,   20,  '/chat/send');
-const rlRankSend        = makeLimiter(60,   5,  '/rank/send');
-const rlRankReport      = makeLimiter(60,  10,  '/rank/report');
-const rlHeartbeat       = makeLimiter(1,   60,  '/heartbeat');
-const rlEnumeration     = makeLimiter(1,   60,  'enumeration');
-const rlTelegramPublic  = makeLimiter(1,   60,  'telegram-public');
-const rlDelete          = makeLimiter(60,   5,  '/delete');
-const rlSupportSend     = makeLimiter(1,   30,  '/support/send');
-const rlSupportCreate   = makeLimiter(60,   5,  '/support/create');
+function makeLimiter(windowMin, max, label) { return rateLimit({ windowMs: windowMin * 60 * 1000, max, standardHeaders: true, legacyHeaders: false, message: { status: 'error', message: `Слишком много запросов (${label}).` } }); }
+const rlLogin = makeLimiter(15, 10, '/login');
+const rlRegister = makeLimiter(60, 5, '/register');
+const rlAdminLogin = makeLimiter(15, 5, '/admin/login');
+const rlKeysValidate = makeLimiter(1, 30, '/keys/validate');
+const rlKeysUpdateUser = makeLimiter(1, 30, '/keys/update-user');
+const rlChatSend = makeLimiter(1, 20, '/chat/send');
+const rlRankSend = makeLimiter(60, 5, '/rank/send');
+const rlRankReport = makeLimiter(60, 10, '/rank/report');
+const rlHeartbeat = makeLimiter(1, 60, '/heartbeat');
+const rlEnumeration = makeLimiter(1, 60, 'enumeration');
+const rlTelegramPublic = makeLimiter(1, 60, 'telegram-public');
+const rlDelete = makeLimiter(60, 5, '/delete');
+const rlSupportSend = makeLimiter(1, 30, '/support/send');
+const rlSupportCreate = makeLimiter(60, 5, '/support/create');
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  MONGODB DATABASE SETUP & CACHE
-// ═══════════════════════════════════════════════════════════════════════════
 const mongoClient = new MongoClient(process.env.MONGODB_URI || '', { autoSelectFamily: false });
 let mongoDb = null;
-let dbCache = {}; // Кэш в памяти для мгновенной работы
+let dbCache = {};
 
 async function initDB() {
     try {
         await mongoClient.connect();
         mongoDb = mongoClient.db('clumsyvpn');
         console.log('[DB] Connected to MongoDB');
-
         const collections = ['users', 'keys', 'bot_keys', 'state', 'deleted_keys', 'reports', 'perm_bans', 'rank_posts', 'rank_mutes', 'telegram_links', 'support', 'chat'];
         for (const c of collections) {
             const doc = await mongoDb.collection('app_data').findOne({ _id: c });
             dbCache[c] = doc ? doc.data : null;
         }
-        console.log('[DB] Cache loaded from MongoDB');
-    } catch (e) {
-        console.error('[DB] FATAL ERROR:', e);
-        process.exit(1);
-    }
+        console.log('[DB] Cache loaded');
+    } catch (e) { console.error('[DB] FATAL ERROR:', e); process.exit(1); }
 }
 
-function getData(name, fallback) {
-    const val = dbCache[name];
-    return (val === null || val === undefined) ? fallback : val;
-}
-
+function getData(name, fallback) { const val = dbCache[name]; return (val === null || val === undefined) ? fallback : val; }
 function saveData(name, data) {
     dbCache[name] = data;
-    if (mongoDb) {
-        mongoDb.collection('app_data').replaceOne(
-            { _id: name },
-            { _id: name, data: data },
-            { upsert: true }
-        ).catch(err => console.error('[DB] Save error:', name, err));
-    }
+    if (mongoDb) { mongoDb.collection('app_data').replaceOne({ _id: name }, { _id: name, data: data }, { upsert: true }).catch(err => console.error('[DB] Save error:', name, err)); }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ЗАГРУЗКА / СОХРАНЕНИЕ
-// ═══════════════════════════════════════════════════════════════════════════
-function loadUsers()  { return getData('users', {}); }
+function loadUsers() { return getData('users', {}); }
 function saveUsers(u) { saveData('users', u); }
-
-function loadState() {
-    const d = { appDisabled: false, peakOnline: 0, onlineSessions: {} };
-    return Object.assign(d, getData('state', {}));
-}
+function loadState() { const d = { appDisabled: false, peakOnline: 0, onlineSessions: {} }; return Object.assign(d, getData('state', {})); }
 function saveState(s) { saveData('state', s); }
-
 function loadPermBans() { return getData('perm_bans', { logins: [], deviceIds: [] }); }
 function savePermBans(d) { saveData('perm_bans', d); }
-
 function loadReports() { return getData('reports', { reports: [], reporterLimits: {} }); }
 function saveReports(d) { saveData('reports', d); }
-
 function loadRankPosts() { return getData('rank_posts', { posts: [] }); }
 function saveRankPosts(d) { saveData('rank_posts', d); }
-
 function loadRankMutes() { return getData('rank_mutes', { mutes: {} }); }
 function saveRankMutes(d) { saveData('rank_mutes', d); }
-
-function loadTelegramLinks() {
-    const d = getData('telegram_links', {});
-    if (!d.tokens) d.tokens = {};
-    if (!d.verifiedDevices) d.verifiedDevices = {};
-    if (!d.pendingByChat) d.pendingByChat = {};
-    return d;
-}
+function loadTelegramLinks() { const d = getData('telegram_links', {}); if (!d.tokens) d.tokens = {}; if (!d.verifiedDevices) d.verifiedDevices = {}; if (!d.pendingByChat) d.pendingByChat = {}; return d; }
 function saveTelegramLinks(d) { saveData('telegram_links', d); }
-
-function loadChat() {
-    const d = getData('chat', { messages: [] });
-    if (!Array.isArray(d.messages)) d.messages = [];
-    return d;
-}
+function loadChat() { const d = getData('chat', { messages: [] }); if (!Array.isArray(d.messages)) d.messages = []; return d; }
 function saveChat(d) { saveData('chat', d); }
-
 function loadSupport() { return getData('support', { chats: {} }); }
 function saveSupport(d) { saveData('support', d); }
-
 function loadKeys() { return getData('keys', { keys: [] }); }
 function saveKeys(d) { saveData('keys', d); }
-
 function loadDeletedKeys() { return getData('deleted_keys', { records: [] }); }
 function saveDeletedKeys(d) { saveData('deleted_keys', d); }
-
 function loadBotKeys() { return getData('bot_keys', { keys: [] }); }
 function saveBotKeys(d) { saveData('bot_keys', d); }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ХЕЛПЕРЫ
-// ═══════════════════════════════════════════════════════════════════════════
 function now() { return new Date().toISOString(); }
 function esc(s) { return s ? String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])) : ''; }
-function safeEqual(a, b) {
-    if (typeof a !== 'string' || typeof b !== 'string') return false;
-    const bufA = Buffer.from(a, 'utf8'), bufB = Buffer.from(b, 'utf8');
-    if (bufA.length !== bufB.length) return false;
-    try { return crypto.timingSafeEqual(bufA, bufB); } catch (_) { return false; }
-}
+function safeEqual(a, b) { if (typeof a !== 'string' || typeof b !== 'string') return false; const bufA = Buffer.from(a, 'utf8'), bufB = Buffer.from(b, 'utf8'); if (bufA.length !== bufB.length) return false; try { return crypto.timingSafeEqual(bufA, bufB); } catch (_) { return false; } }
 function hashPassword(plain) { return bcrypt.hashSync(plain, 10); }
-function verifyPassword(plain, user) {
-    if (!user || !plain) return { ok: false, migrated: false };
-    if (user.passwordHash) return { ok: bcrypt.compareSync(plain, user.passwordHash), migrated: false };
-    if (typeof user.password === 'string' && safeEqual(user.password, plain)) {
-        user.passwordHash = hashPassword(plain); delete user.password;
-        return { ok: true, migrated: true };
-    }
-    return { ok: false, migrated: false };
-}
+function verifyPassword(plain, user) { if (!user || !plain) return { ok: false, migrated: false }; if (user.passwordHash) return { ok: bcrypt.compareSync(plain, user.passwordHash), migrated: false }; if (typeof user.password === 'string' && safeEqual(user.password, plain)) { user.passwordHash = hashPassword(plain); delete user.password; return { ok: true, migrated: true }; } return { ok: false, migrated: false }; }
 
 let usersLock = Promise.resolve();
 function withUsersLock(fn) { const next = usersLock.then(fn, fn); usersLock = next.catch(() => {}); return next; }
 let keysLock = Promise.resolve();
 function withKeysLock(fn) { const next = keysLock.then(fn, fn); keysLock = next.catch(() => {}); return next; }
 
-function getUserId(login) {
-    let hash = 0; for (const c of login) hash = Math.imul(hash, 31) + c.charCodeAt(0) | 0;
-    return '#' + ((Math.abs(hash) * 9973 + 100000) % 100000000 + 10000000);
-}
+function getUserId(login) { let hash = 0; for (const c of login) hash = Math.imul(hash, 31) + c.charCodeAt(0) | 0; return '#' + ((Math.abs(hash) * 9973 + 100000) % 100000000 + 10000000); }
 function isAdmin(login) { return login === ADMIN_LOGIN; }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ADMIN SESSIONS
-// ═══════════════════════════════════════════════════════════════════════════
 const ADMIN_SESSIONS = new Map();
 const ADMIN_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 function createAdminSession() { const token = crypto.randomBytes(32).toString('hex'); ADMIN_SESSIONS.set(token, { expiresAt: Date.now() + ADMIN_SESSION_TTL_MS }); return token; }
-function isValidAdminSession(token) {
-    if (!token) return false;
-    const s = ADMIN_SESSIONS.get(token);
-    if (!s) return false;
-    if (s.expiresAt < Date.now()) { ADMIN_SESSIONS.delete(token); return false; }
-    return true;
-}
+function isValidAdminSession(token) { if (!token) return false; const s = ADMIN_SESSIONS.get(token); if (!s) return false; if (s.expiresAt < Date.now()) { ADMIN_SESSIONS.delete(token); return false; } return true; }
 setInterval(() => { const nowMs = Date.now(); for (const [t, s] of ADMIN_SESSIONS.entries()) { if (s.expiresAt < nowMs) ADMIN_SESSIONS.delete(t); } }, 10 * 60 * 1000);
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ОСТАЛЬНЫЕ ХЕЛПЕРЫ (Telegram, Ban, Keys)
-// ═══════════════════════════════════════════════════════════════════════════
 function telegramConfigured() { return !!TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKEN.indexOf('ВСТАВЬТЕ') !== 0; }
 function telegramUsernameConfigured() { return !!TELEGRAM_BOT_USERNAME && TELEGRAM_BOT_USERNAME.indexOf('ВСТАВЬТЕ') !== 0; }
 function telegramFullyConfigured() { return telegramConfigured() && telegramUsernameConfigured(); }
 function isTokenExpired(rec) { return !rec || !rec.expiresAt || new Date(rec.expiresAt).getTime() < Date.now(); }
 function generateLinkToken() { return crypto.randomBytes(24).toString('hex'); }
-async function tgApi(method, params) {
-    if (!telegramConfigured()) return null;
-    try {
-        const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {}) });
-        const data = await resp.json();
-        if (!data.ok) return null;
-        return data.result;
-    } catch (e) { return null; }
-}
+async function tgApi(method, params) { if (!telegramConfigured()) return null; try { const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {}) }); const data = await resp.json(); if (!data.ok) return null; return data.result; } catch (e) { return null; } }
 function tgSend(chatId, text, extra) { return tgApi('sendMessage', Object.assign({ chat_id: chatId, text }, extra || {})); }
-function formatBotDate(isoStr) {
-    if (!isoStr) return '';
-    const d = new Date(isoStr), sh = new Date(d.getTime() + TELEGRAM_DISPLAY_TZ_OFFSET_MIN * 60 * 1000);
-    return String(sh.getUTCDate()).padStart(2, '0') + '.' + String(sh.getUTCMonth() + 1).padStart(2, '0') + '.' + sh.getUTCFullYear() + ' ' + String(sh.getUTCHours()).padStart(2, '0') + ':' + String(sh.getUTCMinutes()).padStart(2, '0');
-}
-function cleanupExpiredTelegramTokens() {
-    const d = loadTelegramLinks(); let c = false;
-    for (const t of Object.keys(d.tokens)) { if (!d.tokens[t].used && isTokenExpired(d.tokens[t])) { delete d.tokens[t]; c = true; } }
-    if (c) saveTelegramLinks(d);
-}
-setInterval(cleanupExpiredTelegramTokens, 60 * 60 * 1000);
 
-const HEARTBEAT_TIMEOUT = 35000;
-function getOnlineCount(state) { const nowMs = Date.now(); let c = 0; for (const k of Object.keys(state.onlineSessions || {})) { if (nowMs - state.onlineSessions[k] < HEARTBEAT_TIMEOUT) c++; } return c; }
-function recordHeartbeat(login, state) { if (!state.onlineSessions) state.onlineSessions = {}; state.onlineSessions[login] = Date.now(); const online = getOnlineCount(state); if (online > (state.peakOnline || 0)) state.peakOnline = online; saveState(state); }
+function cleanupExpiredTelegramTokens() { const d = loadTelegramLinks(); let c = false; for (const t of Object.keys(d.tokens)) { if (!d.tokens[t].used && isTokenExpired(d.tokens[t])) { delete d.tokens[t]; c = true; } } if (c) saveTelegramLinks(d); }
+setInterval(cleanupExpiredTelegramTokens, 60 * 60 * 1000);
 
 function isPermBanned(login, deviceId) { const pb = loadPermBans(); if (login && pb.logins.includes(login)) return true; if (deviceId && pb.deviceIds.includes(deviceId)) return true; return false; }
 function addPermBan(login, deviceId) { const pb = loadPermBans(); if (login && !pb.logins.includes(login)) pb.logins.push(login); if (deviceId && !pb.deviceIds.includes(deviceId)) pb.deviceIds.push(deviceId); savePermBans(pb); }
 function removePermBan(login) { const pb = loadPermBans(); pb.logins = pb.logins.filter(l => l !== login); savePermBans(pb); }
-function findActiveBanByDevice(users, deviceId) {
-    if (!deviceId) return null; const nowMs = Date.now();
-    for (const u of Object.values(users)) { if (u.deviceId !== deviceId || !u.ban) continue; if (u.ban.until === 'permanent') return { login: u.login, ban: u.ban }; if (u.ban.until && new Date(u.ban.until).getTime() > nowMs) return { login: u.login, ban: u.ban }; }
-    return null;
-}
+function findActiveBanByDevice(users, deviceId) { if (!deviceId) return null; const nowMs = Date.now(); for (const u of Object.values(users)) { if (u.deviceId !== deviceId || !u.ban) continue; if (u.ban.until === 'permanent') return { login: u.login, ban: u.ban }; if (u.ban.until && new Date(u.ban.until).getTime() > nowMs) return { login: u.login, ban: u.ban }; } return null; }
 
-function getKeyStatus(k) {
-    if (k.banFreeze) return 'banned';
-    const nowMs = Date.now();
-    if (k.expiryAt && k.expiryAt !== 'forever' && new Date(k.expiryAt).getTime() < nowMs) return 'expired';
-    if (k.deactivated && k.users.length === 0) return 'deactivated';
-    if (k.users.length > 0) return 'active';
-    return 'inactive';
-}
-const BAN_RESTORE_THRESHOLD_MS = 30 * 60 * 1000;
+function getKeyStatus(k) { if (k.banFreeze) return 'banned'; const nowMs = Date.now(); if (k.expiryAt && k.expiryAt !== 'forever' && new Date(k.expiryAt).getTime() < nowMs) return 'expired'; if (k.deactivated && k.users.length === 0) return 'deactivated'; if (k.users.length > 0) return 'active'; return 'inactive'; }
 function keyBanFreezeMatchesLogin(k, login) { if (!k.banFreeze || !login) return false; if (k.banFreeze.login === login) return true; return Array.isArray(k.banFreeze.accountsHistory) && k.banFreeze.accountsHistory.some(h => h.login === login); }
-function findKeyBoundToLogin(keysData, login) {
-    if (!login) return null;
-    for (const k of keysData.keys) { const idx = k.users.findIndex(u => u.login === login); if (idx >= 0) return { key: k, userIndex: idx }; }
-    for (const k of keysData.keys) { const idx = k.users.findIndex(u => Array.isArray(u.accountsHistory) && u.accountsHistory.some(h => h.login === login)); if (idx >= 0) return { key: k, userIndex: idx }; }
-    return null;
-}
+function findKeyBoundToLogin(keysData, login) { if (!login) return null; for (const k of keysData.keys) { const idx = k.users.findIndex(u => u.login === login); if (idx >= 0) return { key: k, userIndex: idx }; } for (const k of keysData.keys) { const idx = k.users.findIndex(u => Array.isArray(u.accountsHistory) && u.accountsHistory.some(h => h.login === login)); if (idx >= 0) return { key: k, userIndex: idx }; } return null; }
+
 function applyBanToKey(targetLogin, reasonText) {
-    const keysData = loadKeys(), found = findKeyBoundToLogin(keysData, targetLogin);
-    if (!found) return null;
-    const k = found.key, bu = k.users[found.userIndex], status = getKeyStatus(k);
-    if (status === 'expired' || status === 'banned') return null;
+    const keysData = loadKeys(), found = findKeyBoundToLogin(keysData, targetLogin); if (!found) return null;
+    const k = found.key, bu = k.users[found.userIndex], status = getKeyStatus(k); if (status === 'expired' || status === 'banned') return null;
     const reason = (reasonText || '').substring(0, 30); let info;
     if (k.maxDevices === 1) {
         let remainingMs = (!k.expiryAt || k.expiryAt === 'forever') ? -1 : Math.max(0, new Date(k.expiryAt).getTime() - Date.now());
-        k.users.splice(found.userIndex, 1);
-        k.banFreeze = { bindId: bu.bindId || '', device: bu.device || 'Android', loginAt: bu.loginAt || '', login: bu.login || targetLogin, userId: bu.userId || '', accountsHistory: bu.accountsHistory || [], remainingMs, reason, frozenAt: now() };
+        k.users.splice(found.userIndex, 1); k.banFreeze = { bindId: bu.bindId || '', device: bu.device || 'Android', loginAt: bu.loginAt || '', login: bu.login || targetLogin, userId: bu.userId || '', accountsHistory: bu.accountsHistory || [], remainingMs, reason, frozenAt: now() };
         info = { key: k.key, maxDevices: 1 }; if (k.botKey) syncBotKeyStatus(k.key, 'blocked', reason);
     } else {
         if (!k.deactivatedUsers) k.deactivatedUsers = [];
         k.deactivatedUsers.push({ login: bu.login || targetLogin, userId: bu.userId || '', bindId: bu.bindId || '', device: bu.device || 'Android', loginAt: bu.loginAt || '', accountsHistory: bu.accountsHistory || [], reason: reason || 'Блокировка', deactivatedAt: now(), notified: false, viaBan: true });
-        k.users.splice(found.userIndex, 1);
-        info = { key: k.key, maxDevices: k.maxDevices }; if (k.botKey && k.users.length === 0) syncBotKeyStatus(k.key, 'blocked', reason);
+        k.users.splice(found.userIndex, 1); info = { key: k.key, maxDevices: k.maxDevices }; if (k.botKey && k.users.length === 0) syncBotKeyStatus(k.key, 'blocked', reason);
     }
     saveKeys(keysData); return info;
 }
 function restoreKeyAfterUnban(targetLogin) {
-    if (!targetLogin) return 'not_found';
-    const keysData = loadKeys(); let changed = false, result = 'not_found'; const nowMs = Date.now();
+    if (!targetLogin) return 'not_found'; const keysData = loadKeys(); let changed = false, result = 'not_found'; const nowMs = Date.now();
     for (const k of keysData.keys) {
         if (!keyBanFreezeMatchesLogin(k, targetLogin)) continue;
         const hasOther = keysData.keys.some(k2 => k2 !== k && !k2.deleted && !k2.deactivated && !k2.banFreeze && (!k2.expiryAt || k2.expiryAt === 'forever' || new Date(k2.expiryAt).getTime() > nowMs) && Array.isArray(k2.users) && k2.users.some(u => u.login === targetLogin));
         if (hasOther) { k.banFreeze = null; result = 'superseded'; changed = true; break; }
         const remainingMs = k.banFreeze.remainingMs;
         if (remainingMs !== -1 && remainingMs <= BAN_RESTORE_THRESHOLD_MS) { k.expiryAt = now(); k.banFreeze = null; if (k.botKey) syncBotKeyStatus(k.key, 'expired', ''); result = 'too_little_time'; } 
-        else {
-            k.users.push({ bindId: k.banFreeze.bindId, device: k.banFreeze.device || 'Android', loginAt: k.banFreeze.loginAt, login: k.banFreeze.login, userId: k.banFreeze.userId, accountsHistory: k.banFreeze.accountsHistory || [] });
-            k.expiryAt = remainingMs === -1 ? 'forever' : new Date(Date.now() + remainingMs).toISOString();
-            k.deactivated = false; k.banFreeze = null; if (k.botKey) syncBotKeyStatus(k.key, 'active', ''); result = 'restored';
-        }
+        else { k.users.push({ bindId: k.banFreeze.bindId, device: k.banFreeze.device || 'Android', loginAt: k.banFreeze.loginAt, login: k.banFreeze.login, userId: k.banFreeze.userId, accountsHistory: k.banFreeze.accountsHistory || [] }); k.expiryAt = remainingMs === -1 ? 'forever' : new Date(Date.now() + remainingMs).toISOString(); k.deactivated = false; k.banFreeze = null; if (k.botKey) syncBotKeyStatus(k.key, 'active', ''); result = 'restored'; }
         changed = true; break;
     }
     if (changed) saveKeys(keysData); return result;
 }
 function syncBotKeyStatus(keyValue, status, reason) {
-    if (!keyValue) return;
-    const bd = loadBotKeys(), bk = bd.keys.find(k => k.key === keyValue); if (!bk) return;
-    bk.status = status;
-    if (status === 'deactivated' || status === 'blocked') { bk.deactivatedAt = now(); bk.reason = reason || (status === 'blocked' ? 'Заблокирован' : 'Деактивирован'); bk.cooldownUntil = new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(); } 
-    else { bk.deactivatedAt = null; bk.reason = ''; bk.cooldownUntil = null; }
+    if (!keyValue) return; const bd = loadBotKeys(), bk = bd.keys.find(k => k.key === keyValue); if (!bk) return;
+    bk.status = status; if (status === 'deactivated' || status === 'blocked') { bk.deactivatedAt = now(); bk.reason = reason || (status === 'blocked' ? 'Заблокирован' : 'Деактивирован'); bk.cooldownUntil = new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(); } else { bk.deactivatedAt = null; bk.reason = ''; bk.cooldownUntil = null; }
     saveBotKeys(bd);
 }
 function evictExpiredKeyUsers() {
     const data = loadKeys(); let c = false;
-    for (const k of data.keys) {
-        if (getKeyStatus(k) === 'expired' && k.users.length > 0) {
-            if (!k.expiredUsers) k.expiredUsers = [];
-            for (const u of k.users) { if (!k.expiredUsers.find(e => e.login === u.login || e.bindId === u.bindId)) k.expiredUsers.push(u); }
-            k.users = []; c = true;
-        }
-    }
+    for (const k of data.keys) { if (getKeyStatus(k) === 'expired' && k.users.length > 0) { if (!k.expiredUsers) k.expiredUsers = []; for (const u of k.users) { if (!k.expiredUsers.find(e => e.login === u.login || e.bindId === u.bindId)) k.expiredUsers.push(u); } k.users = []; c = true; } }
     if (c) saveKeys(data);
 }
-setInterval(evictExpiredKeyUsers, 60 * 1000);
-evictExpiredKeyUsers();
+setInterval(evictExpiredKeyUsers, 60 * 1000); evictExpiredKeyUsers();
 
-function clearDeletedKeyMark(deviceId, login) {
-    const d = loadDeletedKeys(); let c = false;
-    for (const rec of d.records) { const before = rec.users.length; rec.users = rec.users.filter(u => !((deviceId && u.bindId === deviceId) || (login && u.login === login))); if (rec.users.length !== before) c = true; }
-    if (c) saveDeletedKeys(d);
-}
-function clearDeactivationMark(deviceId, login) {
-    if (!deviceId && !login) return;
-    const d = loadKeys(); let c = false;
-    for (const k of d.keys) { if (!k.deactivatedUsers) continue; const before = k.deactivatedUsers.length; k.deactivatedUsers = k.deactivatedUsers.filter(u => !((deviceId && u.bindId === deviceId) || (login && u.login === login))); if (k.deactivatedUsers.length !== before) c = true; }
-    if (c) saveKeys(d);
-}
+function clearDeletedKeyMark(deviceId, login) { const d = loadDeletedKeys(); let c = false; for (const rec of d.records) { const before = rec.users.length; rec.users = rec.users.filter(u => !((deviceId && u.bindId === deviceId) || (login && u.login === login))); if (rec.users.length !== before) c = true; } if (c) saveDeletedKeys(d); }
+function clearDeactivationMark(deviceId, login) { if (!deviceId && !login) return; const d = loadKeys(); let c = false; for (const k of d.keys) { if (!k.deactivatedUsers) continue; const before = k.deactivatedUsers.length; k.deactivatedUsers = k.deactivatedUsers.filter(u => !((deviceId && u.bindId === deviceId) || (login && u.login === login))); if (k.deactivatedUsers.length !== before) c = true; } if (c) saveKeys(d); }
 function deactivatedUserMessage(entry) { const word = entry && entry.viaBan ? 'заблокирован' : 'деактивирован'; return 'Ваш ключ ' + word + ' администратором.\n\nПричина: ' + (entry ? entry.reason : ''); }
 
-function requireAdmin(req, res, next) {
-    const auth = (req.headers['authorization'] || '').trim();
-    if (auth.startsWith('Bearer ')) { if (isValidAdminSession(auth.slice(7))) return next(); return res.status(403).json({ status: 'forbidden', message: 'Недействительный токен' }); }
-    if (LEGACY_ADMIN_PASSWORD_ON) {
-        const { adminLogin, adminPassword } = req.body || {};
-        if (adminLogin === ADMIN_LOGIN && typeof adminPassword === 'string' && safeEqual(adminPassword, ADMIN_PASSWORD)) return next();
-    }
-    return res.status(403).json({ status: 'forbidden', message: 'Нет доступа' });
-            }
+function requireAdmin(req, res, next) { const auth = (req.headers['authorization'] || '').trim(); if (auth.startsWith('Bearer ')) { if (isValidAdminSession(auth.slice(7))) return next(); return res.status(403).json({ status: 'forbidden', message: 'Недействительный токен' }); } if (LEGACY_ADMIN_PASSWORD_ON) { const { adminLogin, adminPassword } = req.body || {}; if (adminLogin === ADMIN_LOGIN && typeof adminPassword === 'string' && safeEqual(adminPassword, ADMIN_PASSWORD)) return next(); } return res.status(403).json({ status: 'forbidden', message: 'Нет доступа' }); }
+
+const HEARTBEAT_TIMEOUT = 35000;
+function getOnlineCount(state) { const nowMs = Date.now(); let c = 0; for (const k of Object.keys(state.onlineSessions || {})) { if (nowMs - state.onlineSessions[k] < HEARTBEAT_TIMEOUT) c++; } return c; }
+function recordHeartbeat(login, state) { if (!state.onlineSessions) state.onlineSessions = {}; state.onlineSessions[login] = Date.now(); const online = getOnlineCount(state); if (online > (state.peakOnline || 0)) state.peakOnline = online; saveState(state); }
+
+function cleanupExpiredPunishments() { const users = loadUsers(); const nowMs = Date.now(); let c = false; for (const login of Object.keys(users)) { const u = users[login]; if (u.ban && u.ban.until && u.ban.until !== 'permanent' && new Date(u.ban.until).getTime() < nowMs) { delete u.ban; c = true; } if (u.mute && u.mute.until && new Date(u.mute.until).getTime() < nowMs) { delete u.mute; c = true; } } if (c) saveUsers(users); }
+setInterval(cleanupExpiredPunishments, 60 * 1000);
 app.post('/heartbeat', rlHeartbeat, (req, res) => { const { login } = req.body || {}; if (!login) return res.json({ status: 'ok' }); const state = loadState(); recordHeartbeat(login, state); return res.json({ status: 'ok', appDisabled: state.appDisabled || false }); });
 app.post('/pre-check', rlRegister, async (req, res) => { const { login, deviceId } = req.body || {}; if (!login) return res.status(400).json({ status: 'error' }); if (login === ADMIN_LOGIN) return res.status(409).json({ status: 'already_exists' }); if (isPermBanned(login, deviceId)) return res.status(403).json({ status: 'perm_banned', message: 'У вас постоянный бан.' }); cleanupExpiredPunishments(); const users = loadUsers(); const activeBan = findActiveBanByDevice(users, deviceId); if (activeBan) return res.status(403).json({ status: 'device_banned', ban: activeBan.ban, message: 'Активный бан.' }); if (users[login]) { if (users[login].ban) return res.status(403).json({ status: 'device_banned', ban: users[login].ban, message: 'Активный бан.' }); return res.status(409).json({ status: 'already_exists', message: 'Логин уже занят' }); } return res.json({ status: 'ok' }); });
 
@@ -350,24 +199,71 @@ app.get('/app-status', (req, res) => { const state = loadState(); return res.jso
 app.get('/app-version', (req, res) => { res.json({ version: "1.0", update_url: "https://t.me/ClumsyOxs" }); });
 app.get('/telegram/config', rlTelegramPublic, (req, res) => { return res.json({ status: 'ok', enabled: telegramConfigured(), botUsername: telegramFullyConfigured() ? TELEGRAM_BOT_USERNAME : '' }); });
 
-// (Остальные роуты: /telegram/poll-token, /keys/..., /support/..., /admin/..., /bot/... ОСТАЮТСЯ ТАКИМИ ЖЕ, как в твоем старом файле. 
-// Чтобы не превышать лимит символов, я не дублирую их здесь, но в твоем index.js они уже есть и будут работать с новой базой автоматически).
+app.post('/telegram/poll-token', rlTelegramPublic, (req, res) => { const { deviceId } = req.body || {}; if (!deviceId) return res.status(400).json({ status: 'error' }); const links = loadTelegramLinks(); let foundToken = null, foundCreatedAt = ''; for (const t of Object.keys(links.tokens)) { const r = links.tokens[t]; if (r.pendingDeviceId === deviceId && !r.used && !isTokenExpired(r)) { if (r.createdAt > foundCreatedAt) { foundToken = t; foundCreatedAt = r.createdAt; } } } return res.json({ status: 'ok', found: !!foundToken, token: foundToken || '' }); });
+app.post('/keys/token-by-device', rlTelegramPublic, (req, res) => { const { deviceId } = req.body || {}; if (!deviceId) return res.json({ found: false }); const links = loadTelegramLinks(); let bestToken = null, bestUsedAt = ''; for (const t of Object.keys(links.tokens)) { const r = links.tokens[t]; if (!r.used || r.usedDeviceId !== deviceId) continue; if (!bestToken || r.usedAt > bestUsedAt) { bestToken = t; bestUsedAt = r.usedAt; } } if (bestToken) return res.json({ found: true, token: bestToken }); const kd = loadKeys(); for (const k of kd.keys) { if (getKeyStatus(k) === 'expired') continue; if (k.users.find(u => u.bindId === deviceId)) return res.json({ found: true, token: k.key }); } return res.json({ found: false }); });
+app.post('/telegram/check-token', rlTelegramPublic, (req, res) => { const { token, deviceId } = req.body || {}; const clean = (token || '').trim(); if (!clean) return res.status(400).json({ status: 'error', message: 'Введите токен' }); if (!deviceId) return res.status(400).json({ status: 'error', message: 'Устройство не определено' }); const links = loadTelegramLinks(); const rec = links.tokens[clean]; if (!rec) return res.status(404).json({ status: 'error', message: 'Токен не найден' }); if (isTokenExpired(rec) && !(rec.used && rec.usedDeviceId === deviceId)) return res.status(403).json({ status: 'error', message: 'Токен истёк' }); if (rec.used && rec.usedDeviceId !== deviceId) return res.status(403).json({ status: 'error', message: 'Токен уже использован' }); if (!rec.used) { rec.used = true; rec.usedDeviceId = deviceId; rec.usedAt = now(); links.verifiedDevices[deviceId] = { telegramId: rec.telegramId, username: rec.username, firstName: rec.firstName, verifiedAt: now(), usernameHistory: [], firstNameHistory: [] }; } else { const ex = links.verifiedDevices[deviceId]; if (ex) { const nowStr = now(); if (!ex.usernameHistory) ex.usernameHistory = []; if (!ex.firstNameHistory) ex.firstNameHistory = []; if (rec.username !== (ex.username || '')) { ex.usernameHistory.push({ old: ex.username || '', new: rec.username, changedAt: nowStr }); ex.username = rec.username; } if (rec.firstName !== (ex.firstName || '')) { ex.firstNameHistory.push({ old: ex.firstName || '', new: rec.firstName, changedAt: nowStr }); ex.firstName = rec.firstName; } ex.telegramId = rec.telegramId; ex.verifiedAt = nowStr; } } saveTelegramLinks(links); return res.json({ status: 'ok', id: rec.telegramId, username: rec.username || '', firstName: rec.firstName || '', telegram: { id: rec.telegramId, username: rec.username, firstName: rec.firstName } }); });
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ФУНКЦИИ ОЧИСТКИ И ЗАПУСК СЕРВЕРА
-// ═══════════════════════════════════════════════════════════════════════════
-function cleanupExpiredPunishments() {
-    const users = loadUsers(); const nowMs = Date.now(); let c = false;
-    for (const login of Object.keys(users)) { const u = users[login]; if (u.ban && u.ban.until && u.ban.until !== 'permanent' && new Date(u.ban.until).getTime() < nowMs) { delete u.ban; c = true; } if (u.mute && u.mute.until && new Date(u.mute.until).getTime() < nowMs) { delete u.mute; c = true; } }
-    if (c) saveUsers(users);
-}
-setInterval(cleanupExpiredPunishments, 60 * 1000);
+app.post('/keys/validate', rlKeysValidate, async (req, res) => { await withKeysLock(async () => { const { key, deviceId } = req.body || {}; if (!key) return res.status(400).json({ status: 'error', message: 'Введите ключ' }); const deletedData = loadDeletedKeys(); if (deletedData.records.find(r => r.key === key)) return res.status(403).json({ status: 'key_deleted', message: 'Ключ был удалён администратором.' }); evictExpiredKeyUsers(); const data = loadKeys(); const k = data.keys.find(e => e.key === key); if (!k) return res.status(404).json({ status: 'error', message: 'Ключ не найден' }); const st = getKeyStatus(k); if (st === 'expired') return res.status(403).json({ status: 'error', message: 'Срок действия ключа истёк' }); if (st === 'banned') return res.status(403).json({ status: 'banned', message: 'Ключ заблокирован из-за бана.' }); if (st === 'deactivated') return res.status(403).json({ status: 'deactivated', message: 'Ключ деактивирован' }); if (deviceId) { const existing = k.users.find(u => u.bindId === deviceId); if (existing) { if (k.deactivatedUsers) { const deact = k.deactivatedUsers.find(u => u.bindId === deviceId); if (deact) return res.status(403).json({ status: 'deactivated', message: deactivatedUserMessage(deact) }); } clearDeactivationMark(deviceId, existing.login || null); clearDeletedKeyMark(deviceId, existing.login || null); return res.json({ status: 'ok', message: 'Ключ действителен' }); } if (k.deactivatedUsers) { const deact = k.deactivatedUsers.find(u => u.bindId === deviceId); if (deact) return res.status(403).json({ status: 'deactivated', message: deactivatedUserMessage(deact) }); } const activeOther = data.keys.find(o => { if (o.key === key) return false; if (getKeyStatus(o) === 'expired') return false; return o.users.some(u => u.bindId === deviceId); }); if (activeOther) return res.status(403).json({ status: 'already_has_key', message: 'У вас уже есть активный ключ' }); if (k.maxDevices > 0 && k.users.length >= k.maxDevices) return res.status(403).json({ status: 'error', message: 'Достигнут лимит устройств' }); k.users.push({ bindId: deviceId, device: 'Android', loginAt: now(), login: '', userId: '', accountsHistory: [] }); if (!k.expiryAt) { let durMs = 0; if (k.expiryMinutes && k.expiryMinutes > 0) durMs = k.expiryMinutes * 60 * 1000; else if (k.expiryDays && k.expiryDays > 0) durMs = k.expiryDays * 24 * 3600 * 1000; k.expiryAt = durMs > 0 ? new Date(Date.now() + durMs).toISOString() : 'forever'; } saveKeys(data); clearDeactivationMark(deviceId, null); clearDeletedKeyMark(deviceId, null); } return res.json({ status: 'ok', message: 'Ключ активирован' }); }); });
 
+app.post('/keys/check-deactivated', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); const data = loadKeys(); for (const k of data.keys) { if (!k.deactivatedUsers) continue; const d = k.deactivatedUsers.find(u => (login && u.login === login) || (deviceId && u.bindId === deviceId)); if (!d) continue; if (d.notified === true) continue; return res.json({ status: 'deactivated', reason: d.reason, viaBan: !!d.viaBan, message: deactivatedUserMessage(d) }); } return res.json({ status: 'ok' }); });
+app.post('/keys/deactivated-ack', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); const data = loadKeys(); let changed = false; for (const k of data.keys) { if (!k.deactivatedUsers) continue; const d = k.deactivatedUsers.find(u => (login && u.login === login) || (deviceId && u.bindId === deviceId)); if (d && !d.notified) { d.notified = true; changed = true; } } if (changed) saveKeys(data); return res.json({ status: 'ok' }); });
+app.post('/keys/check-deleted', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); const deletedData = loadDeletedKeys(); for (const rec of deletedData.records) { const m = rec.users.find(u => (login && u.login === login) || (deviceId && u.bindId === deviceId)); if (m) return res.json({ status: 'key_deleted', reason: rec.reason, message: 'Ключ был удалён администратором.\n\nПричина: ' + rec.reason }); } return res.json({ status: 'ok' }); });
+app.post('/keys/check-expired', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); const data = loadKeys(); for (const k of data.keys) { if (getKeyStatus(k) !== 'expired') continue; const all = (k.users || []).concat(k.expiredUsers || []); const m = all.find(u => (login && u.login === login) || (deviceId && u.bindId === deviceId)); if (m) return res.json({ status: 'key_expired' }); } return res.json({ status: 'ok' }); });
+app.post('/check-account-exists', rlEnumeration, (req, res) => { const { login } = req.body || {}; if (!login) return res.status(400).json({ status: 'error' }); if (login === ADMIN_LOGIN) return res.json({ status: 'ok', exists: true }); const users = loadUsers(); return res.json({ status: 'ok', exists: !!users[login] }); });
+app.post('/keys/check-membership', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); const data = loadKeys(); for (const k of data.keys) { const m = (k.users || []).find(u => (login && u.login === login) || (deviceId && u.bindId === deviceId)); if (m) return res.json({ status: 'ok', hasKey: true }); } return res.json({ status: 'ok', hasKey: false }); });
+app.post('/check-banned', rlEnumeration, (req, res) => { const { login, deviceId } = req.body || {}; if (!login && !deviceId) return res.status(400).json({ status: 'error' }); if (isPermBanned(login, deviceId)) return res.json({ status: 'banned', selfBanned: true, ban: { until: 'permanent', reason: 'Перманентный бан' }, user_id: login ? getUserId(login) : '' }); cleanupExpiredPunishments(); const users = loadUsers(); const u = login ? users[login] : null; if (u && u.ban) return res.json({ status: 'banned', selfBanned: true, ban: u.ban, user_id: getUserId(login) }); if (login) { const keysData = loadKeys(); for (const k of keysData.keys) { if (keyBanFreezeMatchesLogin(k, login) && k.banFreeze.login !== login) { const origBan = (users[k.banFreeze.login] && users[k.banFreeze.login].ban) ? users[k.banFreeze.login].ban : { until: 'permanent', reason: k.banFreeze.reason || '', keyInfo: { key: k.key, maxDevices: k.maxDevices || 1 } }; return res.json({ status: 'banned', selfBanned: false, bannedLogin: k.banFreeze.login, bannedUserId: (users[k.banFreeze.login] && users[k.banFreeze.login].userId) || '', ban: origBan, user_id: getUserId(login) }); } } } if (!u && deviceId) { const activeBan = findActiveBanByDevice(users, deviceId); if (activeBan) return res.json({ status: 'banned', selfBanned: true, ban: activeBan.ban, user_id: activeBan.login ? getUserId(activeBan.login) : '' }); } return res.json({ status: 'ok' }); });
+app.post('/keys/update-user', rlKeysUpdateUser, async (req, res) => { await withKeysLock(async () => { const { key, deviceId, login, userId } = req.body || {}; if (!key || !deviceId) return res.status(400).json({ status: 'error' }); if (login) { const users = loadUsers(); if (!users[login]) return res.status(404).json({ status: 'error' }); } const data = loadKeys(); const k = data.keys.find(e => e.key === key); if (!k) return res.status(404).json({ status: 'error' }); const user = k.users.find(u => u.bindId === deviceId); if (user) { if (login) user.login = login; if (userId) user.userId = userId; if (!user.accountsHistory) user.accountsHistory = []; if (login && login.trim()) { const ex = user.accountsHistory.find(h => h.login === login); if (!ex) user.accountsHistory.push({ login, userId: userId || '', firstAt: now(), device: user.device || 'Android', bindId: user.bindId || deviceId }); else if (userId && !ex.userId) ex.userId = userId; } saveKeys(data); } clearDeactivationMark(deviceId, login || null); clearDeletedKeyMark(deviceId, login || null); if (k.botKey) { const botData = loadBotKeys(); const bk = botData.keys.find(e => e.key === key); if (bk) { bk.status = 'active'; if (!bk.users) bk.users = []; const bkUser = bk.users.find(u => u.bindId === deviceId); const snapshot = (user && user.accountsHistory) ? user.accountsHistory : []; if (!bkUser) bk.users.push({ login: login || '', userId: userId || '', device: (k.users.find(u => u.bindId === deviceId) || {}).device || 'Android', bindId: deviceId, loginAt: now(), accountsHistory: snapshot }); else { if (login) bkUser.login = login; if (userId) bkUser.userId = userId; bkUser.accountsHistory = snapshot; } saveBotKeys(botData); } } return res.json({ status: 'ok' }); }); });
+
+app.post('/chat/send', rlChatSend, async (req, res) => { const { login, password, text, messageId } = req.body || {}; if (!login || !password || !text || !text.trim()) return res.status(400).json({ status: 'error' }); const users = loadUsers(); const u = users[login]; if (!u) return res.status(401).json({ status: 'error' }); if (!verifyPassword(password, u).ok) return res.status(401).json({ status: 'error' }); if (!isAdmin(login) && u.mute) { const muteUntil = new Date(u.mute.until).getTime(); if (muteUntil > Date.now()) return res.status(403).json({ status: 'muted', message: 'Вы в муте', mute: u.mute }); delete u.mute; saveUsers(users); } const chat = loadChat(); const msg = { id: messageId || (Date.now() + '_' + Math.random().toString(36).slice(2, 8)), login: login.trim(), text: text.trim().substring(0, 500), timestamp: Date.now() }; chat.messages.push(msg); if (chat.messages.length > 500) chat.messages.splice(0, chat.messages.length - 500); saveChat(chat); return res.json({ status: 'ok', message: msg }); });
+app.get('/chat/messages', rlEnumeration, (req, res) => { const since = parseInt(req.query.since || '0', 10); const chat = loadChat(); const result = since === 0 ? chat.messages.slice(-50) : chat.messages.filter(m => m.timestamp > since); return res.json({ status: 'ok', messages: result }); });
+app.get('/user/:login', rlEnumeration, (req, res) => { const { login } = req.params; if (login === ADMIN_LOGIN) return res.json({ status: 'ok', login: ADMIN_LOGIN, created_at: '2024-01-01T00:00:00.000Z', user_id: '000001', deleted: false, ban: null }); const users = loadUsers(); const u = users[login]; if (!u) return res.json({ status: 'deleted', deleted: true, login }); return res.json({ status: 'ok', login: u.login, created_at: u.created_at, user_id: getUserId(login), deleted: false, ban: u.ban ? { until: u.ban.until, reason: u.ban.reason || '' } : null }); });
+app.get('/mute-status/:login', rlEnumeration, (req, res) => { const { login } = req.params; if (isAdmin(login)) return res.json({ status: 'ok', muted: false }); const users = loadUsers(); const u = users[login]; if (!u) return res.json({ status: 'ok', muted: false }); if (u.mute) { if (new Date(u.mute.until).getTime() > Date.now()) return res.json({ status: 'ok', muted: true, mute: u.mute }); delete u.mute; saveUsers(users); } return res.json({ status: 'ok', muted: false }); });
+app.post('/report', rlRankReport, (req, res) => { const { reporterLogin, targetLogin, messageText, messageId } = req.body || {}; if (!reporterLogin || !targetLogin || !messageText) return res.status(400).json({ status: 'error' }); if (reporterLogin === targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); const data = loadReports(); const nowMs = Date.now(); if (!data.reporterLimits) data.reporterLimits = {}; let limits = data.reporterLimits[reporterLogin] || { count: 0, reportedUsers: [], resetAt: 0 }; if (nowMs > limits.resetAt) limits = { count: 0, reportedUsers: [], resetAt: nowMs + 24 * 60 * 60 * 1000 }; if (limits.reportedUsers.includes(targetLogin)) return res.status(429).json({ status: 'already_reported' }); if (limits.count >= 3) return res.status(429).json({ status: 'limit_reached' }); limits.count++; limits.reportedUsers.push(targetLogin); data.reporterLimits[reporterLogin] = limits; data.reports.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), reporterLogin, targetLogin, messageText, messageId: messageId || null, timestamp: nowMs, seen: false }); saveReports(data); return res.json({ status: 'ok' }); });
+app.post('/admin/login', rlAdminLogin, (req, res) => { const { password } = req.body || {}; if (!password || !safeEqual(password, ADMIN_PASSWORD)) return res.status(401).json({ status: 'wrong_password' }); const token = createAdminSession(); return res.json({ status: 'ok', token, expiresIn: ADMIN_SESSION_TTL_MS / 1000 }); });
+app.post('/admin/stats', requireAdmin, (req, res) => { const users = loadUsers(); const state = loadState(); const online = getOnlineCount(state); if (online > (state.peakOnline || 0)) { state.peakOnline = online; saveState(state); } const reports = loadReports(); return res.json({ status: 'ok', online, peakOnline: state.peakOnline || 0, totalAccounts: Object.keys(users).length, appDisabled: state.appDisabled || false, unseenReports: reports.reports.filter(r => !r.seen).length }); });
+app.post('/admin/disable-app', requireAdmin, (req, res) => { const { disabled } = req.body || {}; const state = loadState(); state.appDisabled = !!disabled; saveState(state); return res.json({ status: 'ok', appDisabled: state.appDisabled }); });
+app.post('/admin/ban', requireAdmin, async (req, res) => { await withUsersLock(async () => { const { targetLogin, days, reason } = req.body || {}; if (!targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); let banUntil; if (days === 'permanent' || days === -1 || days === '-1') banUntil = 'permanent'; else { const dn = parseInt(days, 10); if (!Number.isFinite(dn) || dn < 1 || dn > 3650) return res.status(400).json({ status: 'error' }); banUntil = new Date(Date.now() + dn * 24 * 60 * 60 * 1000).toISOString(); } const users = loadUsers(); if (!users[targetLogin]) return res.status(404).json({ status: 'error' }); const reasonText = (reason || '').substring(0, 30); const keyInfo = applyBanToKey(targetLogin, reasonText); users[targetLogin].ban = { until: banUntil, reason: reasonText, by: ADMIN_LOGIN, at: now(), keyInfo }; saveUsers(users); const rD = loadReports(); rD.reports = rD.reports.filter(r => r.targetLogin !== targetLogin); saveReports(rD); const rk = loadRankPosts(); rk.posts = rk.posts.filter(p => p.login !== targetLogin); saveRankPosts(rk); if (banUntil === 'permanent') addPermBan(targetLogin, users[targetLogin].deviceId || null); return res.json({ status: 'ok' }); }); });
+app.post('/admin/unban', requireAdmin, async (req, res) => { await withUsersLock(async () => { const { targetLogin } = req.body || {}; if (!targetLogin) return res.status(400).json({ status: 'error' }); const users = loadUsers(); if (!users[targetLogin]) return res.status(404).json({ status: 'error' }); delete users[targetLogin].ban; saveUsers(users); removePermBan(targetLogin); restoreKeyAfterUnban(targetLogin); return res.json({ status: 'ok' }); }); });
+app.post('/admin/mute', requireAdmin, async (req, res) => { await withUsersLock(async () => { const { targetLogin, hours, reason } = req.body || {}; if (!targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); const hn = parseInt(hours, 10); if (!Number.isFinite(hn) || hn < 1 || hn > 125) return res.status(400).json({ status: 'error' }); const users = loadUsers(); if (!users[targetLogin]) return res.status(404).json({ status: 'error' }); users[targetLogin].mute = { until: new Date(Date.now() + hn * 60 * 60 * 1000).toISOString(), hours: hn, reason: (reason || '').substring(0, 30), by: ADMIN_LOGIN, at: now() }; saveUsers(users); const rD = loadReports(); rD.reports = rD.reports.filter(r => r.targetLogin !== targetLogin); saveReports(rD); return res.json({ status: 'ok' }); }); });
+app.post('/admin/unmute', requireAdmin, async (req, res) => { await withUsersLock(async () => { const { targetLogin } = req.body || {}; if (!targetLogin) return res.status(400).json({ status: 'error' }); const users = loadUsers(); if (!users[targetLogin]) return res.status(404).json({ status: 'error' }); delete users[targetLogin].mute; saveUsers(users); return res.json({ status: 'ok' }); }); });
+app.post('/admin/banned-list', requireAdmin, (req, res) => { const users = loadUsers(); const list = []; for (const [login, u] of Object.entries(users)) { if (u.ban) list.push({ login, user_id: getUserId(login), created_at: u.created_at, ban: u.ban }); } return res.json({ status: 'ok', users: list }); });
+app.post('/admin/muted-list', requireAdmin, (req, res) => { const users = loadUsers(); const list = []; const nowMs = Date.now(); for (const [login, u] of Object.entries(users)) { if (u.mute && new Date(u.mute.until).getTime() > nowMs) list.push({ login, user_id: getUserId(login), created_at: u.created_at, mute: u.mute }); } return res.json({ status: 'ok', users: list }); });
+app.post('/admin/reports', requireAdmin, (req, res) => { const data = loadReports(); const grouped = {}; for (const r of data.reports) { if (!grouped[r.targetLogin]) grouped[r.targetLogin] = { targetLogin: r.targetLogin, count: 0, reports: [] }; grouped[r.targetLogin].count++; grouped[r.targetLogin].reports.push(r); } const list = Object.values(grouped).sort((a, b) => b.count - a.count); const users = loadUsers(); for (const it of list) { const u = users[it.targetLogin]; it.userId = u ? getUserId(it.targetLogin) : '—'; it.createdAt = u ? u.created_at : null; } return res.json({ status: 'ok', users: list }); });
+app.post('/admin/reports/mark-seen', requireAdmin, (req, res) => { const data = loadReports(); for (const r of data.reports) r.seen = true; saveReports(data); return res.json({ status: 'ok' }); });
+app.post('/admin/reports/dismiss', requireAdmin, (req, res) => { const { reportId, targetLogin } = req.body || {}; const data = loadReports(); if (reportId) data.reports = data.reports.filter(r => r.id !== reportId); else if (targetLogin) data.reports = data.reports.filter(r => r.targetLogin !== targetLogin); else return res.status(400).json({ status: 'error' }); saveReports(data); return res.json({ status: 'ok' }); });
+app.post('/admin/reports/unseen-count', requireAdmin, (req, res) => { const data = loadReports(); return res.json({ status: 'ok', count: data.reports.filter(r => !r.seen).length }); });
+app.post('/admin/keys/create', requireAdmin, async (req, res) => { await withKeysLock(async () => { const { maxDevices, expiryDays, expiryMinutes } = req.body || {}; const md = parseInt(maxDevices, 10), ed = parseInt(expiryDays, 10), em = parseInt(expiryMinutes, 10); if (!Number.isFinite(md) || md < 0 || !Number.isFinite(ed) || ed < 0 || !Number.isFinite(em) || em < 0) return res.status(400).json({ status: 'error' }); const data = loadKeys(); let keyValue, attempts = 0; const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; const genKey = () => { let k = ''; for (let i = 0; i < 4; i++) { if (i > 0) k += '-'; for (let j = 0; j < 4; j++) k += chars[Math.floor(Math.random() * chars.length)]; } return k; }; do { keyValue = genKey(); attempts++; } while (data.keys.find(k => k.key === keyValue) && attempts < 100); data.keys.push({ key: keyValue, createdAt: now(), maxDevices: md, expiryDays: ed, expiryMinutes: em, expiryAt: null, users: [] }); saveKeys(data); return res.json({ status: 'ok', key: keyValue }); }); });
+app.post('/admin/keys/list', requireAdmin, (req, res) => { evictExpiredKeyUsers(); cleanupExpiredPunishments(); const data = loadKeys(); const users = loadUsers(); const tgLinks = loadTelegramLinks(); data.keys = data.keys.filter(k => !k.botKey); const bannedSet = new Set(); for (const [login, u] of Object.entries(users)) if (u.ban) bannedSet.add(login); const getTg = (bindId) => { if (!bindId) return null; const tg = tgLinks.verifiedDevices[bindId]; if (!tg) return null; const last = (h) => (h && h.length > 0) ? h[h.length - 1] : null; return { id: tg.telegramId || '', username: tg.username || '', firstName: tg.firstName || '', verifiedAt: tg.verifiedAt || '', lastUsernameChange: last(tg.usernameHistory), lastFirstNameChange: last(tg.firstNameHistory) }; }; const result = data.keys.map(k => ({ key: k.key, status: getKeyStatus(k), maxDevices: k.maxDevices, expiryDays: k.expiryDays, expiryMinutes: k.expiryMinutes || 0, createdAt: k.createdAt, expiryAt: k.expiryAt, usersCount: k.users.length, users: k.users.map(u => ({ ...u, isBanned: u.login ? bannedSet.has(u.login) : false, telegram: getTg(u.bindId), accountsHistory: (u.accountsHistory || []).map(h => ({ ...h, isBanned: bannedSet.has(h.login), isActive: h.login === u.login })) })), bannedUser: k.banFreeze ? { bindId: k.banFreeze.bindId, device: k.banFreeze.device, loginAt: k.banFreeze.loginAt, login: k.banFreeze.login, userId: k.banFreeze.userId, accountsHistory: k.banFreeze.accountsHistory || [], reason: k.banFreeze.reason, frozenAt: k.banFreeze.frozenAt, restorable: k.banFreeze.remainingMs === -1 || k.banFreeze.remainingMs > BAN_RESTORE_THRESHOLD_MS, telegram: getTg(k.banFreeze.bindId) } : null, deactivatedUsers: (k.deactivatedUsers || []).map(u => ({ login: u.login || '', userId: u.userId || '', bindId: u.bindId || '', device: u.device || '', loginAt: u.loginAt || '', accountsHistory: (u.accountsHistory || []).map(h => ({ ...h, isBanned: bannedSet.has(h.login), isActive: h.login === u.login })), reason: u.reason || '', deactivatedAt: u.deactivatedAt || '', viaBan: !!u.viaBan, telegram: getTg(u.bindId) })) })); return res.json({ status: 'ok', keys: result }); });
+app.post('/admin/keys/delete', requireAdmin, (req, res) => { const { key, reason } = req.body || {}; if (!key) return res.status(400).json({ status: 'error' }); const safeReason = (reason || '').trim(); const data = loadKeys(); const idx = data.keys.findIndex(k => k.key === key); if (idx < 0) return res.status(404).json({ status: 'error' }); const removed = data.keys[idx]; const affected = []; for (const u of (removed.users || [])) affected.push({ login: u.login || '', userId: u.userId || '', bindId: u.bindId || '' }); for (const u of (removed.deactivatedUsers || [])) affected.push({ login: u.login || '', userId: u.userId || '', bindId: u.bindId || '' }); const deletedData = loadDeletedKeys(); deletedData.records.push({ key: removed.key, reason: safeReason, deletedAt: now(), users: affected }); saveDeletedKeys(deletedData); data.keys.splice(idx, 1); saveKeys(data); return res.json({ status: 'ok', affectedCount: affected.length }); });
+app.post('/admin/keys/deactivate-user', requireAdmin, (req, res) => { const { userLogin, userId, reason } = req.body || {}; if (!userLogin && !userId) return res.status(400).json({ status: 'error' }); if (!reason) return res.status(400).json({ status: 'error' }); const data = loadKeys(); let found = false; for (const k of data.keys) { const idx = k.users.findIndex(u => (userLogin && u.login === userLogin) || (userId && u.userId === userId)); if (idx < 0) continue; found = true; const removed = k.users[idx]; if (!k.deactivatedUsers) k.deactivatedUsers = []; k.deactivatedUsers.push({ login: removed.login || userLogin || '', userId: removed.userId || userId || '', bindId: removed.bindId || '', device: removed.device || 'Android', loginAt: removed.loginAt || '', accountsHistory: removed.accountsHistory || [], reason, deactivatedAt: new Date().toISOString(), notified: false }); k.users.splice(idx, 1); if (k.users.length === 0 && k.maxDevices === 1) { k.deactivated = true; if (k.botKey) syncBotKeyStatus(k.key, 'deactivated', reason); } break; } if (!found) return res.status(404).json({ status: 'error' }); saveKeys(data); return res.json({ status: 'ok' }); });
+app.post('/admin/chat/delete-messages', requireAdmin, (req, res) => { const { messageIds } = req.body || {}; if (!Array.isArray(messageIds) || !messageIds.length) return res.status(400).json({ status: 'error' }); const idSet = new Set(messageIds); const chat = loadChat(); const before = chat.messages.length; const filtered = chat.messages.filter(m => !idSet.has(m.id)); chat.messages.length = 0; chat.messages.push(...filtered); saveChat(chat); return res.json({ status: 'ok', deleted: before - chat.messages.length }); });
+app.post('/admin/rank/delete-posts', requireAdmin, (req, res) => { const { postIds } = req.body || {}; if (!Array.isArray(postIds) || postIds.length === 0) return res.status(400).json({ status: 'error' }); const idSet = new Set(postIds); const data = loadRankPosts(); const before = data.posts.length; data.posts = data.posts.filter(p => !idSet.has(p.id)); saveRankPosts(data); return res.json({ status: 'ok', deleted: before - data.posts.length }); });
+app.post('/admin/rank/mute-from-report', requireAdmin, (req, res) => { const { login, createdAt, reason } = req.body || {}; if (!login) return res.status(400).json({ status: 'error' }); const users = loadUsers(); const u = users[login]; const userCreatedAt = createdAt || (u ? u.created_at : ''); const mutesData = loadRankMutes(); mutesData.mutes[`${login}:${userCreatedAt}`] = { login, createdAt: userCreatedAt, reason: reason || 'Нарушение правил', mutedAt: now(), mutedBy: 'admin' }; saveRankMutes(mutesData); return res.json({ status: 'ok' }); });
+app.post('/admin/bot/keys/list', requireAdmin, (req, res) => { const data = loadBotKeys(); const tgLinks = loadTelegramLinks(); const usersData = loadUsers(); const bannedSet = new Set(); for (const [login, u] of Object.entries(usersData)) if (u.ban) bannedSet.add(login); const result = data.keys.filter(k => !k.deleted).map(k => { let tgInfo = null; const tid = String(k.telegramId); for (const vd of Object.values(tgLinks.verifiedDevices)) { if (String(vd.telegramId) === tid) { tgInfo = { id: tid, username: vd.username || '', firstName: vd.firstName || '' }; break; } } return { key: k.key, telegramId: k.telegramId, telegram: tgInfo, status: getKeyStatus(k), maxDevices: 1, expiryDays: k.expiryDays || 1488, createdAt: k.createdAt, expiryAt: k.expiryAt, users: (k.users || []).map(u => ({ ...u, isBanned: u.login ? bannedSet.has(u.login) : false, accountsHistory: (u.accountsHistory || []).map(h => ({ ...h, isBanned: bannedSet.has(h.login), isActive: h.login === u.login })) })), deactivatedAt: k.deactivatedAt || null, reason: k.reason || '', cooldownUntil: k.cooldownUntil || null }; }); return res.json({ status: 'ok', keys: result }); });
+
+// ПОЛЬЗОВАТЕЛЬСКАЯ ПОДДЕРЖКА И ЧАТЫ
+app.post('/support/chat/create', rlSupportCreate, (req, res) => { const { login, password, chatName } = req.body || {}; if (!login || !password || !chatName) return res.status(400).json({ status: 'error' }); const isAdminUser = (login === ADMIN_LOGIN && safeEqual(password, ADMIN_PASSWORD)); if (!isAdminUser) { const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.status(401).json({ status: 'error' }); const cd = u.supportCooldownUntil; if (cd && Date.now() < cd) return res.status(429).json({ status: 'cooldown', cooldownUntil: cd }); } const data = loadSupport(); const chatId = 'chat_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10); const nowMs = Date.now(); data.chats[chatId] = { id: chatId, name: chatName.substring(0, 20), userLogin: login, createdAt: new Date(nowMs).toISOString(), messages: [{ id: 'bot_' + nowMs, sender: 'bot', senderLogin: 'Бот', text: 'Приветствую, ' + esc(login) + '!\n\nЭто онлайн помощь.\nОпишите проблему.', timestamp: nowMs }], archived: false, searching: false, adminJoined: false, adminLogin: null, waitingSince: null }; saveSupport(data); return res.json({ status: 'ok', chatId }); });
+app.post('/support/chats', (req, res) => { const { login, password } = req.body || {}; if (!login || !password) return res.status(400).json({ status: 'error' }); const isAdminUser = (login === ADMIN_LOGIN && safeEqual(password, ADMIN_PASSWORD)); if (!isAdminUser) { const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.status(401).json({ status: 'error' }); } const users = loadUsers(); const data = loadSupport(); const cooldownUntil = (users[login] && users[login].supportCooldownUntil) || 0; const chats = []; for (const chat of Object.values(data.chats)) { if (chat.userLogin !== login) continue; const msgs = chat.messages || []; const lastUserMsg = msgs.filter(m => m.sender === 'user' || m.sender === 'admin').slice(-1)[0]; chats.push({ id: chat.id, name: chat.name, archived: chat.archived, searching: chat.searching && !chat.adminJoined && !chat.archived, lastMessage: lastUserMsg ? lastUserMsg.text : '' }); } chats.sort((a, b) => { const ca = data.chats[a.id], cb = data.chats[b.id]; return (cb ? new Date(cb.createdAt).getTime() : 0) - (ca ? new Date(ca.createdAt).getTime() : 0); }); return res.json({ status: 'ok', chats, cooldownUntil }); });
+app.post('/support/chat/messages', (req, res) => { const { login, password, chatId, since } = req.body || {}; if (!login || !password || !chatId) return res.status(400).json({ status: 'error' }); const isAdminPoll = (login === ADMIN_LOGIN && safeEqual(password, ADMIN_PASSWORD)); if (!isAdminPoll) { const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.status(401).json({ status: 'error' }); } const data = loadSupport(); const chat = data.chats[chatId]; if (!chat || (chat.userLogin !== login && !isAdminPoll)) return res.status(404).json({ status: 'error' }); const sinceMs = parseInt(since || '0', 10); const messages = (chat.messages || []).filter(m => m.timestamp > sinceMs); return res.json({ status: 'ok', messages, archived: chat.archived, searching: chat.searching && !chat.adminJoined && !chat.archived, adminJoined: chat.adminJoined }); });
+app.post('/support/chat/send', rlSupportSend, (req, res) => { const { login, password, chatId, text } = req.body || {}; if (!login || !password || !chatId || !text) return res.status(400).json({ status: 'error' }); const isAdminSend = (login === ADMIN_LOGIN && safeEqual(password, ADMIN_PASSWORD)); if (!isAdminSend) { const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.status(401).json({ status: 'error' }); } const data = loadSupport(); const chat = data.chats[chatId]; if (!chat || (chat.userLogin !== login && !isAdminSend)) return res.status(404).json({ status: 'error' }); if (chat.archived) return res.status(403).json({ status: 'archived' }); const nowMs = Date.now(); chat.messages.push({ id: 'msg_' + nowMs + '_' + Math.random().toString(36).slice(2, 6), sender: 'user', senderLogin: login, text: text.substring(0, 1000), timestamp: nowMs }); const userMsgCount = chat.messages.filter(m => m.sender === 'user').length; if (userMsgCount === 1) { chat.searching = true; chat.waitingSince = nowMs; chat.problem = text.substring(0, 500); } saveSupport(data); return res.json({ status: 'ok', ok: true }); });
+app.post('/support/admin/queue', requireAdmin, (req, res) => { const data = loadSupport(); const nowMs = Date.now(); const queue = []; const users = loadUsers(); for (const chat of Object.values(data.chats)) { if (chat.archived) continue; const hasUserMsg = (chat.messages || []).some(m => m.sender === 'user'); if (!hasUserMsg) continue; const u = users[chat.userLogin] || {}; queue.push({ chatId: chat.id, login: chat.userLogin, userId: getUserId(chat.userLogin), createdAt: u.created_at || '', waitMs: nowMs - (chat.waitingSince || nowMs), problem: chat.problem || '', adminJoined: chat.adminJoined }); } queue.sort((a, b) => b.waitMs - a.waitMs); return res.json({ status: 'ok', queue }); });
+app.post('/support/admin/messages', requireAdmin, (req, res) => { const { chatId, since } = req.body || {}; const data = loadSupport(); const chat = data.chats[chatId]; if (!chat) return res.status(404).json({ status: 'error' }); const sinceMs = parseInt(since || '0', 10); const messages = (chat.messages || []).filter(m => m.timestamp > sinceMs); return res.json({ status: 'ok', messages, archived: chat.archived }); });
+app.post('/support/admin/send', requireAdmin, (req, res) => { const { chatId, text } = req.body || {}; if (!chatId || !text) return res.status(400).json({ status: 'error' }); const data = loadSupport(); const chat = data.chats[chatId]; if (!chat) return res.status(404).json({ status: 'error' }); if (chat.archived) return res.status(403).json({ status: 'archived' }); const nowMs = Date.now(); chat.messages.push({ id: 'admin_' + nowMs, sender: 'admin', senderLogin: ADMIN_LOGIN, text: text.substring(0, 1000), timestamp: nowMs }); chat.adminJoined = true; chat.searching = false; saveSupport(data); return res.json({ status: 'ok', ok: true }); });
+app.post('/support/admin/finish', requireAdmin, (req, res) => { const { chatId } = req.body || {}; const data = loadSupport(); const chat = data.chats[chatId]; if (!chat) return res.status(404).json({ status: 'error' }); chat.archived = true; chat.searching = false; saveSupport(data); return res.json({ status: 'ok' }); });
+
+app.post('/rank/send', rlRankSend, (req, res) => { const { login, password, createdAt, description, images } = req.body || {}; if (!login || !password || !createdAt) return res.status(400).json({ error: 'Missing fields' }); if (!Array.isArray(images) || images.length === 0 || images.length > 3) return res.status(400).json({ error: 'Invalid images' }); const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.status(401).json({ error: 'Invalid credentials' }); const mutesData = loadRankMutes(); const userKey = `${login}:${createdAt}`; if (mutesData.mutes[userKey]) return res.status(403).json({ error: 'You are muted' }); const data = loadRankPosts(); const post = { id: Date.now() + '_' + Math.random().toString(36).slice(2, 11), login, createdAt, description: description || '', images: images.slice(0, 3), timestamp: Date.now(), createdDate: now() }; data.posts.unshift(post); if (data.posts.length > 200) data.posts = data.posts.slice(0, 200); saveRankPosts(data); return res.json({ status: 'ok', postId: post.id }); });
+app.get('/rank/posts', (req, res) => { const since = parseInt(req.query.since || '0', 10); const data = loadRankPosts(); if (since === 0) return res.json(data.posts.slice(0, 50)); return res.json(data.posts.filter(p => p.timestamp > since)); });
+app.get('/rank/mute-status', (req, res) => { const { login, createdAt } = req.query; if (!login || !createdAt) return res.status(400).json({ error: 'Missing fields' }); const mutesData = loadRankMutes(); const info = mutesData.mutes[`${login}:${createdAt}`]; if (info) return res.json({ muted: true, reason: info.reason || 'Нарушение правил', mutedAt: info.mutedAt, mutedBy: info.mutedBy || 'admin' }); return res.json({ muted: false }); });
+app.post('/rank/report', rlRankReport, (req, res) => { const { reporterLogin, targetLogin, postId, description, imageBase64 } = req.body || {}; if (!reporterLogin || !targetLogin || !postId) return res.status(400).json({ status: 'error' }); if (reporterLogin === targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); const data = loadReports(); const nowMs = Date.now(); if (!data.reporterLimits) data.reporterLimits = {}; let limits = data.reporterLimits[reporterLogin] || { count: 0, reportedUsers: [], resetAt: 0 }; if (nowMs > limits.resetAt) limits = { count: 0, reportedUsers: [], resetAt: nowMs + 24 * 60 * 60 * 1000 }; const reportKey = 'rank_' + targetLogin + '_' + postId; if (limits.reportedUsers.includes(reportKey)) return res.status(429).json({ status: 'already_reported' }); if (limits.count >= 5) return res.status(429).json({ status: 'limit_reached' }); limits.count++; limits.reportedUsers.push(reportKey); data.reporterLimits[reporterLogin] = limits; data.reports.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), type: 'rank_photo', reporterLogin, targetLogin, postId, messageText: '[Фото] ' + (description || ''), imageBase64: imageBase64 || null, timestamp: nowMs, seen: false }); saveReports(data); return res.json({ status: 'ok' }); });
+
+// БОТ-КЛЮЧИ
+app.post('/bot/keys/list', (req, res) => { const { login, password, deviceId } = req.body || {}; if (!login || !password || !deviceId) return res.json({ status: 'error', keys: [] }); const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.json({ status: 'error', keys: [] }); const tgLinks = loadTelegramLinks(); const vd = tgLinks.verifiedDevices[deviceId]; if (!vd || !vd.telegramId) return res.json({ status: 'ok', keys: [] }); if (!u.telegram || String(u.telegram.id) !== String(vd.telegramId)) return res.json({ status: 'ok', keys: [] }); const data = loadBotKeys(); const result = data.keys.filter(k => String(k.telegramId) === String(vd.telegramId) && !k.deleted).map(k => ({ key: k.key, status: getKeyStatus(k), maxDevices: 1, expiryDays: k.expiryDays || 1488, createdAt: k.createdAt, expiryAt: k.expiryAt, users: k.users || [], deactivatedAt: k.deactivatedAt || null, reason: k.reason || '' })); return res.json({ status: 'ok', keys: result }); });
+
+// ЗАПУСК СЕРВЕРА
 initDB().then(() => {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`ClumsyVPN auth server running on port ${PORT}`);
         console.log(`  Telegram: ${telegramConfigured() ? 'ON' : 'OFF'}`);
-        console.log(`  CORS: disabled`);
         console.log(`  DB: MongoDB connected`);
     });
 });
