@@ -274,6 +274,233 @@ app.get('/rank/mute-status', (req, res) => { const { login, createdAt } = req.qu
 app.post('/rank/report', rlRankReport, (req, res) => { const { reporterLogin, targetLogin, postId, description, imageBase64 } = req.body || {}; if (!reporterLogin || !targetLogin || !postId) return res.status(400).json({ status: 'error' }); if (reporterLogin === targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); const data = loadReports(); const nowMs = Date.now(); if (!data.reporterLimits) data.reporterLimits = {}; let limits = data.reporterLimits[reporterLogin] || { count: 0, reportedUsers: [], resetAt: 0 }; if (nowMs > limits.resetAt) limits = { count: 0, reportedUsers: [], resetAt: nowMs + 24 * 60 * 60 * 1000 }; const reportKey = 'rank_' + targetLogin + '_' + postId; if (limits.reportedUsers.includes(reportKey)) return res.status(429).json({ status: 'already_reported' }); if (limits.count >= 5) return res.status(429).json({ status: 'limit_reached' }); limits.count++; limits.reportedUsers.push(reportKey); data.reporterLimits[reporterLogin] = limits; data.reports.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), type: 'rank_photo', reporterLogin, targetLogin, postId, messageText: '[Фото] ' + (description || ''), imageBase64: imageBase64 || null, timestamp: nowMs, seen: false }); saveReports(data); return res.json({ status: 'ok' }); });
 app.post('/bot/keys/list', (req, res) => { const { login, password, deviceId } = req.body || {}; if (!login || !password || !deviceId) return res.json({ status: 'error', keys: [] }); const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.json({ status: 'error', keys: [] }); const tgLinks = loadTelegramLinks(); const vd = tgLinks.verifiedDevices[deviceId]; if (!vd || !vd.telegramId) return res.json({ status: 'ok', keys: [] }); if (!u.telegram || String(u.telegram.id) !== String(vd.telegramId)) return res.json({ status: 'ok', keys: [] }); const data = loadBotKeys(); const result = data.keys.filter(k => String(k.telegramId) === String(vd.telegramId) && !k.deleted).map(k => ({ key: k.key, status: getKeyStatus(k), maxDevices: 1, expiryDays: k.expiryDays || 1488, createdAt: k.createdAt, expiryAt: k.expiryAt, users: k.users || [], deactivatedAt: k.deactivatedAt || null, reason: k.reason || '' })); return res.json({ status: 'ok', keys: result }); });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  TELEGRAM BOT LOGIC (Движок бота)
+// ═══════════════════════════════════════════════════════════════════════════
+function isTelegramUserVerified(from) {
+    const links = loadTelegramLinks();
+    const tid = String(from.id);
+    for (const vd of Object.values(links.verifiedDevices)) {
+        if (String(vd.telegramId) === tid) return true;
+    }
+    for (const rec of Object.values(links.tokens)) {
+        if (String(rec.telegramId) === tid && rec.used) return true;
+    }
+    return false;
+}
+
+function findActiveTokenForUser(links, telegramId) {
+    for (const t of Object.keys(links.tokens)) {
+        const r = links.tokens[t];
+        if (String(r.telegramId) !== String(telegramId)) continue;
+        if (r.used) continue;
+        if (isTokenExpired(r)) continue;
+        return { tokenStr: t, rec: r };
+    }
+    return null;
+}
+
+function findBoundTokenForUser(links, telegramId, currentDeviceId) {
+    let best = null;
+    for (const t of Object.keys(links.tokens)) {
+        const r = links.tokens[t];
+        if (String(r.telegramId) !== String(telegramId)) continue;
+        if (!r.used) continue;
+        if (currentDeviceId && r.usedDeviceId && currentDeviceId !== r.usedDeviceId) continue;
+        if (!best || r.usedAt > best.rec.usedAt) best = { tokenStr: t, rec: r };
+    }
+    return best;
+}
+
+function formatTokenTimeLeft(rec) {
+    const msLeft = new Date(rec.expiresAt).getTime() - Date.now();
+    if (msLeft <= 0) return '0 сек';
+    const total = Math.ceil(msLeft / 1000);
+    const m = Math.floor(total / 60), s = total % 60;
+    return m > 0 ? (m + ' мин ' + s + ' сек') : (s + ' сек');
+}
+
+function getBotKeyStatus(k) {
+    if (!k) return null;
+    if (k.status === 'deactivated') return 'deactivated';
+    if (k.status === 'blocked') return 'blocked';
+    if (k.deleted) return 'deleted';
+    if (k.expiryAt && new Date(k.expiryAt).getTime() < Date.now()) return 'expired';
+    if (k.users && k.users.length > 0) return 'active';
+    return 'inactive';
+}
+
+async function handleTelegramStart(message) {
+    const chatId = message.chat.id;
+    const from = message.from || {};
+    const parts = message.text.split(' ');
+    const payload = parts.length > 1 ? parts[1].trim() : '';
+    const links = loadTelegramLinks();
+    links.pendingByChat[String(chatId)] = {
+        telegramId: from.id, username: from.username || '', firstName: from.first_name || '',
+        deviceId: payload || null, startedAt: now(),
+    };
+    saveTelegramLinks(links);
+    const name = from.first_name || from.username || 'друг';
+    await tgSend(chatId,
+        `Здравствуйте, ${esc(name)}! 👋 Добро пожаловать в Telegram-бот <b>Oxide Clumsy</b>.\n\n` +
+        '✨ <b>Здесь ты можешь:</b>\n🔑 Получить токен для регистрации в приложении.\n' +
+        '🛡 Быстро пройти проверку и активировать свой аккаунт.\n🎁 Получить ключ доступа автоматически через бота.\n\n' +
+        '👇 <i>Для начала пройди проверку подписки — это откроет все функции.</i>',
+        { parse_mode: 'HTML', reply_markup: { keyboard: [
+            [{ text: '✅ Проверить подписку на приватную группу' }],
+            [{ text: '🔄 Получить токен снова' }],
+            [{ text: '🔑 Получить ключ' }, { text: '📄 Информация о ключе' }]
+        ], resize_keyboard: true, persistent: true } }
+    );
+}
+
+async function handleTelegramCallback(cq) {
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
+    if (cq.data !== 'check_sub') return;
+    await handleTelegramCheckSub(cq.message.chat.id, cq.from || {});
+}
+
+async function handleTelegramCheckSub(chatId, from) {
+    const member = await tgApi('getChatMember', { chat_id: TELEGRAM_GROUP_ID, user_id: from.id });
+    const ok = member && ['member', 'administrator', 'creator'].includes(member.status);
+    if (!ok) {
+        await tgSend(chatId, `К сожалению, вы не являетесь участником приватной группы. Приобрести: ${TELEGRAM_PURCHASE_CONTACT}. Стоимость: ${TELEGRAM_PRICE_TEXT}.`);
+        return;
+    }
+    const links = loadTelegramLinks();
+    const pending = links.pendingByChat[String(chatId)] || {};
+    const existing = findActiveTokenForUser(links, from.id);
+    if (existing) {
+        await tgSend(chatId, '♻️ <b>У вас уже есть действующий токен!</b>\n\n🔑 <code>' + existing.tokenStr + '</code>\n\n⏱ ' + formatTokenTimeLeft(existing.rec), { parse_mode: 'HTML' });
+        return;
+    }
+    const bound = findBoundTokenForUser(links, from.id, pending.deviceId || null);
+    if (bound) {
+        await tgSend(chatId, '⚠️ <b>У вас уже есть привязанный токен.</b>\n\n<code>' + bound.tokenStr + '</code>', { parse_mode: 'HTML' });
+        return;
+    }
+    const token = generateLinkToken();
+    links.tokens[token] = {
+        telegramId: from.id, username: from.username || '', firstName: from.first_name || '',
+        pendingDeviceId: pending.deviceId || null, createdAt: now(),
+        expiresAt: new Date(Date.now() + TELEGRAM_TOKEN_TTL_MS).toISOString(),
+        used: false, usedDeviceId: null, usedAt: null,
+    };
+    saveTelegramLinks(links);
+    await tgSend(chatId, '✅ <b>Ваш токен:</b>\n\n<code>' + token + '</code>\n\n⏱ Введите в приложении в течение 15 минут.', { parse_mode: 'HTML' });
+    await tgSend(chatId, '⚠️ Никому не сообщайте этот токен.', { parse_mode: 'HTML' });
+}
+
+async function handleGetTokenAgain(message) {
+    await handleTelegramCheckSub(message.chat.id, message.from || {});
+}
+
+async function handleGetBotKey(message) {
+    const chatId = message.chat.id;
+    const from = message.from || {};
+    const tid = String(from.id);
+    if (!isTelegramUserVerified(from)) { await tgSend(chatId, '⚠️ <b>Сначала выполните получение токена.</b>', { parse_mode: 'HTML' }); return; }
+    const member = await tgApi('getChatMember', { chat_id: TELEGRAM_GROUP_ID, user_id: from.id });
+    const ok = member && ['member', 'administrator', 'creator'].includes(member.status);
+    if (!ok) { await tgSend(chatId, '❌ Вы не являетесь участником приватной группы.'); return; }
+    const data = loadBotKeys();
+    let existing = data.keys.find(k => String(k.telegramId) === tid && !k.deleted);
+    const keysData = loadKeys();
+    if (existing) {
+        const st = getBotKeyStatus(existing);
+        if (st === 'deactivated' || st === 'blocked') {
+            const cooldown = existing.cooldownUntil ? new Date(existing.cooldownUntil).getTime() : 0;
+            if (cooldown > Date.now()) {
+                const h = Math.ceil((cooldown - Date.now()) / 3600000);
+                await tgSend(chatId, `⚠️ Ваш ключ ${st === 'blocked' ? 'заблокирован' : 'деактивирован'}. Новый можно получить через ${h} ч.`, { parse_mode: 'HTML' });
+                return;
+            }
+            existing.deleted = true;
+        } else if (st === 'expired') { existing.deleted = true; } 
+        else { await tgSend(chatId, '⚠️ У вас уже есть ключ.\n\n🔑 <code>' + existing.key + '</code>', { parse_mode: 'HTML' }); return; }
+    }
+    const generateKey = () => {
+        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        let key = '';
+        for (let i = 0; i < 4; i++) {
+            if (i > 0) key += '-';
+            for (let j = 0; j < 4; j++) key += chars[Math.floor(Math.random() * chars.length)];
+        }
+        return key;
+    };
+    let keyValue, attempts = 0;
+    do { keyValue = generateKey(); attempts++; } while ((keysData.keys.find(k => k.key === keyValue) || data.keys.find(k => k.key === keyValue)) && attempts < 100);
+    const EXPIRY_DAYS = 1488;
+    const expiryAt = new Date(Date.now() + EXPIRY_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const createdAt = now();
+    data.keys.push({ key: keyValue, telegramId: from.id, createdAt, expiryDays: EXPIRY_DAYS, expiryAt, status: 'inactive', users: [], deleted: false });
+    saveBotKeys(data);
+    keysData.keys.push({ key: keyValue, createdAt, maxDevices: 1, expiryDays: EXPIRY_DAYS, expiryMinutes: 0, expiryAt, users: [], botKey: true });
+    saveKeys(keysData);
+    await tgSend(chatId, '✅ <b>Ключ создан!</b>\n\n📱 Устройств: 1\n📅 Срок: ' + EXPIRY_DAYS + ' дней\n\n🔑 <b>Ваш ключ:</b>\n\n<code>' + keyValue + '</code>', { parse_mode: 'HTML' });
+}
+
+async function handleBotKeyInfo(message) {
+    const chatId = message.chat.id;
+    const from = message.from || {};
+    const tid = String(from.id);
+    if (!isTelegramUserVerified(from)) { await tgSend(chatId, '⚠️ Сначала получите токен.'); return; }
+    const data = loadBotKeys();
+    const k = data.keys.find(bk => String(bk.telegramId) === tid && !bk.deleted);
+    if (!k) { await tgSend(chatId, '📄 У вас ещё нет ключа.'); return; }
+    const st = getBotKeyStatus(k);
+    const statusMap = { active: '✅ Активен', inactive: '⏳ Не активирован', deactivated: '❌ Деактивирован', blocked: '🧊 Заблокирован', expired: '⌛ Истёк' };
+    await tgSend(chatId, '📄 <b>Статус:</b> ' + (statusMap[st] || st) + '\n🔑 <code>' + k.key + '</code>', { parse_mode: 'HTML' });
+}
+
+async function handleTelegramUpdate(upd) {
+    if (upd.message && typeof upd.message.text === 'string') {
+        const text = upd.message.text.trim();
+        if (text.startsWith('/start')) await handleTelegramStart(upd.message);
+        else if (text === '✅ Проверить подписку на приватную группу' || text === '🔄 Получить токен снова') await handleGetTokenAgain(upd.message);
+        else if (text === '🔑 Получить ключ') await handleGetBotKey(upd.message);
+        else if (text === '📄 Информация о ключе') await handleBotKeyInfo(upd.message);
+    } else if (upd.callback_query) {
+        await handleTelegramCallback(upd.callback_query);
+    }
+}
+
+let tgOffset = 0, tgPollingActive = false;
+async function tgPollOnce() {
+    const updates = await tgApi('getUpdates', { offset: tgOffset, timeout: 20 });
+    if (!updates) return;
+    for (const upd of updates) {
+        tgOffset = upd.update_id + 1;
+        try { await handleTelegramUpdate(upd); } catch (e) {}
+    }
+}
+async function tgPollLoop() {
+    if (tgPollingActive) return;
+    tgPollingActive = true;
+    while (telegramConfigured()) {
+        try { await tgPollOnce(); } catch (e) {}
+        await new Promise(r => setTimeout(r, 400));
+    }
+    tgPollingActive = false;
+}
+
+if (telegramConfigured()) {
+    tgApi('deleteWebhook', {}).then(() => tgPollLoop());
+    console.log('[telegram] bot long-polling active');
+} else {
+    console.log('[telegram] TELEGRAM_BOT_TOKEN не задан — привязка отключена.');
+}
+// ═══════════════════════════════════════════════════════════════════════════
+
+initDB().then(() => {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`ClumsyVPN auth server running on port ${PORT}`);
+        console.log(`  Telegram: ${telegramConfigured() ? 'ON' : 'OFF'}`);
+        console.log(`  DB: PostgreSQL connected`);
+    });
+});
+
 initDB().then(() => {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`ClumsyVPN auth server running on port ${PORT}`);
