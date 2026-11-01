@@ -1,3 +1,7 @@
+const dns = require('dns');
+// ФИКС БАЗЫ ДАННЫХ: Принудительно используем IPv4 для подключения к Supabase (решает ошибку ENETUNREACH)
+dns.setDefaultResultOrder('ipv4first');
+
 const express   = require('express');
 const cors      = require('cors');
 const crypto    = require('crypto');
@@ -18,6 +22,9 @@ const TELEGRAM_PURCHASE_CONTACT = '@dsoci';
 const TELEGRAM_PRICE_TEXT = '25 Stars или 50 грн';
 const TELEGRAM_TOKEN_TTL_MS = 15 * 60 * 1000;
 const TELEGRAM_DISPLAY_TZ_OFFSET_MIN = process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN ? parseInt(process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN, 10) : 180;
+
+// ФИКС ОШИБКИ РАЗБАНА: Добавлена недостающая константа (24 часа в миллисекундах)
+const BAN_RESTORE_THRESHOLD_MS = 24 * 60 * 60 * 1000; 
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
