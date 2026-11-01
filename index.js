@@ -1,6 +1,5 @@
 const dns = require('dns');
-// ФИКС БАЗЫ ДАННЫХ: Принудительно используем IPv4 для подключения к Supabase (решает ошибку ENETUNREACH)
-dns.setDefaultResultOrder('ipv4first');
+dns.setDefaultResultOrder('ipv4first'); // Фикс БД Supabase (IPv4)
 
 const express   = require('express');
 const cors      = require('cors');
@@ -23,20 +22,19 @@ const TELEGRAM_PRICE_TEXT = '25 Stars или 50 грн';
 const TELEGRAM_TOKEN_TTL_MS = 15 * 60 * 1000;
 const TELEGRAM_DISPLAY_TZ_OFFSET_MIN = process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN ? parseInt(process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN, 10) : 180;
 
-// ФИКС ОШИБКИ РАЗБАНА: Добавлена недостающая константа (24 часа в миллисекундах)
-const BAN_RESTORE_THRESHOLD_MS = 24 * 60 * 60 * 1000; 
+const BAN_RESTORE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // Фикс недостающей переменной
 
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 16) { console.error('[FATAL] ADMIN_PASSWORD не задан или короче 16 символов.'); process.exit(1); }
 
 const app = express();
-
-// ФИКС X_FORWARDED_FOR: Доверяем прокси Render, чтобы rate-limit корректно определял IP
-app.set('trust proxy', 1); 
-
+app.set('trust proxy', 1); // Фикс ошибки express-rate-limit на Render
 app.use(cors({ origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : false, credentials: false }));
 app.use(express.json({ limit: '30mb' }));
+
+// Health Check для UptimeRobot (чтобы сервер не засыпал)
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
 function makeLimiter(windowMin, max, label) { return rateLimit({ windowMs: windowMin * 60 * 1000, max, standardHeaders: true, legacyHeaders: false, message: { status: 'error', message: `Слишком много запросов (${label}).` } }); }
 const rlLogin = makeLimiter(15, 10, '/login');
@@ -54,51 +52,23 @@ const rlDelete = makeLimiter(60, 5, '/delete');
 const rlSupportSend = makeLimiter(1, 30, '/support/send');
 const rlSupportCreate = makeLimiter(60, 5, '/support/create');
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  POSTGRESQL DATABASE SETUP
-// ═══════════════════════════════════════════════════════════════════════════
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Обязательно для Supabase/Render
-});
-
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 let dbCache = {};
 
 async function initDB() {
     try {
-        // Автоматически создаем таблицу, если ее нет
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS app_data (
-                id TEXT PRIMARY KEY,
-                data JSONB
-            );
-        `);
-        console.log('[DB] Table checked/created');
-        
+        await pool.query(`CREATE TABLE IF NOT EXISTS app_data (id TEXT PRIMARY KEY, data JSONB);`);
         const collections = ['users', 'keys', 'bot_keys', 'state', 'deleted_keys', 'reports', 'perm_bans', 'rank_posts', 'rank_mutes', 'telegram_links', 'support', 'chat'];
         for (const c of collections) {
             const res = await pool.query('SELECT data FROM app_data WHERE id = $1', [c]);
             dbCache[c] = res.rows.length > 0 ? res.rows[0].data : null;
         }
         console.log('[DB] Connected to PostgreSQL, cache loaded');
-    } catch (e) {
-        console.error('[DB] FATAL ERROR:', e);
-        process.exit(1);
-    }
+    } catch (e) { console.error('[DB] FATAL ERROR:', e); process.exit(1); }
 }
 
-function getData(name, fallback) {
-    const val = dbCache[name];
-    return (val === null || val === undefined) ? fallback : val;
-}
-
-function saveData(name, data) {
-    dbCache[name] = data;
-    pool.query(
-        'INSERT INTO app_data (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2',
-        [name, JSON.stringify(data)]
-    ).catch(err => console.error('[DB] Save error:', name, err));
-}
+function getData(name, fallback) { const val = dbCache[name]; return (val === null || val === undefined) ? fallback : val; }
+function saveData(name, data) { dbCache[name] = data; pool.query('INSERT INTO app_data (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2', [name, JSON.stringify(data)]).catch(err => console.error('[DB] Save error:', name, err)); }
 
 function loadUsers()  { return getData('users', {}); }
 function saveUsers(u) { saveData('users', u); }
@@ -131,10 +101,8 @@ function safeEqual(a, b) { if (typeof a !== 'string' || typeof b !== 'string') r
 function hashPassword(plain) { return bcrypt.hashSync(plain, 10); }
 function verifyPassword(plain, user) { if (!user || !plain) return { ok: false, migrated: false }; if (user.passwordHash) return { ok: bcrypt.compareSync(plain, user.passwordHash), migrated: false }; if (typeof user.password === 'string' && safeEqual(user.password, plain)) { user.passwordHash = hashPassword(plain); delete user.password; return { ok: true, migrated: true }; } return { ok: false, migrated: false }; }
 
-let usersLock = Promise.resolve();
-function withUsersLock(fn) { const next = usersLock.then(fn, fn); usersLock = next.catch(() => {}); return next; }
-let keysLock = Promise.resolve();
-function withKeysLock(fn) { const next = keysLock.then(fn, fn); keysLock = next.catch(() => {}); return next; }
+let usersLock = Promise.resolve(); function withUsersLock(fn) { const next = usersLock.then(fn, fn); usersLock = next.catch(() => {}); return next; }
+let keysLock = Promise.resolve(); function withKeysLock(fn) { const next = keysLock.then(fn, fn); keysLock = next.catch(() => {}); return next; }
 
 function getUserId(login) { let hash = 0; for (const c of login) hash = Math.imul(hash, 31) + c.charCodeAt(0) | 0; return '#' + ((Math.abs(hash) * 9973 + 100000) % 100000000 + 10000000); }
 function isAdmin(login) { return login === ADMIN_LOGIN; }
@@ -149,7 +117,6 @@ function telegramConfigured() { return !!TELEGRAM_BOT_TOKEN && TELEGRAM_BOT_TOKE
 function telegramUsernameConfigured() { return !!TELEGRAM_BOT_USERNAME && TELEGRAM_BOT_USERNAME.indexOf('ВСТАВЬТЕ') !== 0; }
 function telegramFullyConfigured() { return telegramConfigured() && telegramUsernameConfigured(); }
 function isTokenExpired(rec) { return !rec || !rec.expiresAt || new Date(rec.expiresAt).getTime() < Date.now(); }
-function generateLinkToken() { return crypto.randomBytes(24).toString('hex'); }
 async function tgApi(method, params) { if (!telegramConfigured()) return null; try { const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params || {}) }); const data = await resp.json(); if (!data.ok) return null; return data.result; } catch (e) { return null; } }
 function tgSend(chatId, text, extra) { return tgApi('sendMessage', Object.assign({ chat_id: chatId, text }, extra || {})); }
 
@@ -217,6 +184,7 @@ function recordHeartbeat(login, state) { if (!state.onlineSessions) state.online
 
 function cleanupExpiredPunishments() { const users = loadUsers(); const nowMs = Date.now(); let c = false; for (const login of Object.keys(users)) { const u = users[login]; if (u.ban && u.ban.until && u.ban.until !== 'permanent' && new Date(u.ban.until).getTime() < nowMs) { delete u.ban; c = true; } if (u.mute && u.mute.until && new Date(u.mute.until).getTime() < nowMs) { delete u.mute; c = true; } } if (c) saveUsers(users); }
 setInterval(cleanupExpiredPunishments, 60 * 1000);
+
 app.post('/heartbeat', rlHeartbeat, (req, res) => { const { login } = req.body || {}; if (!login) return res.json({ status: 'ok' }); const state = loadState(); recordHeartbeat(login, state); return res.json({ status: 'ok', appDisabled: state.appDisabled || false }); });
 app.post('/pre-check', rlRegister, async (req, res) => { const { login, deviceId } = req.body || {}; if (!login) return res.status(400).json({ status: 'error' }); if (login === ADMIN_LOGIN) return res.status(409).json({ status: 'already_exists' }); if (isPermBanned(login, deviceId)) return res.status(403).json({ status: 'perm_banned', message: 'У вас постоянный бан.' }); cleanupExpiredPunishments(); const users = loadUsers(); const activeBan = findActiveBanByDevice(users, deviceId); if (activeBan) return res.status(403).json({ status: 'device_banned', ban: activeBan.ban, message: 'Активный бан.' }); if (users[login]) { if (users[login].ban) return res.status(403).json({ status: 'device_banned', ban: users[login].ban, message: 'Активный бан.' }); return res.status(409).json({ status: 'already_exists', message: 'Логин уже занят' }); } return res.json({ status: 'ok' }); });
 app.post('/register', rlRegister, async (req, res) => { await withUsersLock(async () => { try { const { login, password, deviceId, key: regKey } = req.body || {}; if (!login || !password) return res.status(400).json({ status: 'error', message: 'Заполните все поля' }); if (login === ADMIN_LOGIN) return res.status(409).json({ status: 'already_exists', message: 'Логин уже занят' }); if (password.length < 4) return res.status(400).json({ status: 'short_password', message: 'Пароль слишком короткий' }); if (telegramConfigured()) { const tg = loadTelegramLinks(); if (!deviceId || !tg.verifiedDevices[deviceId]) return res.status(403).json({ status: 'telegram_required', message: 'Сначала привяжите Telegram.' }); } const users = loadUsers(); if (isPermBanned(login, deviceId)) return res.status(403).json({ status: 'perm_banned', message: 'Постоянный бан.' }); cleanupExpiredPunishments(); const fresh = loadUsers(); const activeBan = findActiveBanByDevice(fresh, deviceId); if (activeBan) return res.status(403).json({ status: 'device_banned', ban: activeBan.ban, message: 'Активный бан.' }); if (users[login]) { if (users[login].ban) return res.status(403).json({ status: 'device_banned', ban: users[login].ban, message: 'Активный бан.' }); return res.status(409).json({ status: 'already_exists', message: 'Логин уже занят' }); } if (!regKey) return res.status(400).json({ status: 'error', message: 'Ключ обязателен' }); const deletedData = loadDeletedKeys(); if (deletedData.records.find(r => r.key === regKey)) return res.status(403).json({ status: 'key_deleted', message: 'Ключ был удалён' }); evictExpiredKeyUsers(); const kd = loadKeys(); const kEntry = kd.keys.find(e => e.key === regKey); if (!kEntry) return res.status(404).json({ status: 'key_not_found', message: 'Ключ не найден' }); const st = getKeyStatus(kEntry); if (st === 'expired') return res.status(403).json({ status: 'key_expired', message: 'Срок действия ключа истёк' }); if (st === 'banned') return res.status(403).json({ status: 'banned', message: 'Доступ заблокирован из-за бана.' }); if (kEntry.deactivated) return res.status(403).json({ status: 'deactivated', message: 'Ключ деактивирован' }); if (deviceId && kEntry.deactivatedUsers) { const deact = kEntry.deactivatedUsers.find(u => u.bindId === deviceId); if (deact) return res.status(403).json({ status: 'deactivated', message: deactivatedUserMessage(deact) }); } const timestamp = now(); const tgInfo = telegramConfigured() ? (loadTelegramLinks().verifiedDevices[deviceId] || null) : null; users[login] = { login, passwordHash: hashPassword(password), created_at: timestamp, last_login: timestamp, deviceId: deviceId || null, telegram: tgInfo ? { id: tgInfo.telegramId, username: tgInfo.username, firstName: tgInfo.firstName } : null }; saveUsers(users); return res.json({ status: 'ok', message: 'Регистрация успешна', user_id: getUserId(login), created_at: timestamp }); } catch (e) { return res.status(500).json({ status: 'error' }); } }); });
@@ -278,22 +246,40 @@ app.get('/rank/mute-status', (req, res) => { const { login, createdAt } = req.qu
 app.post('/rank/report', rlRankReport, (req, res) => { const { reporterLogin, targetLogin, postId, description, imageBase64 } = req.body || {}; if (!reporterLogin || !targetLogin || !postId) return res.status(400).json({ status: 'error' }); if (reporterLogin === targetLogin) return res.status(400).json({ status: 'error' }); if (targetLogin === ADMIN_LOGIN) return res.status(400).json({ status: 'error' }); const data = loadReports(); const nowMs = Date.now(); if (!data.reporterLimits) data.reporterLimits = {}; let limits = data.reporterLimits[reporterLogin] || { count: 0, reportedUsers: [], resetAt: 0 }; if (nowMs > limits.resetAt) limits = { count: 0, reportedUsers: [], resetAt: nowMs + 24 * 60 * 60 * 1000 }; const reportKey = 'rank_' + targetLogin + '_' + postId; if (limits.reportedUsers.includes(reportKey)) return res.status(429).json({ status: 'already_reported' }); if (limits.count >= 5) return res.status(429).json({ status: 'limit_reached' }); limits.count++; limits.reportedUsers.push(reportKey); data.reporterLimits[reporterLogin] = limits; data.reports.push({ id: Date.now() + '_' + Math.random().toString(36).slice(2, 8), type: 'rank_photo', reporterLogin, targetLogin, postId, messageText: '[Фото] ' + (description || ''), imageBase64: imageBase64 || null, timestamp: nowMs, seen: false }); saveReports(data); return res.json({ status: 'ok' }); });
 app.post('/bot/keys/list', (req, res) => { const { login, password, deviceId } = req.body || {}; if (!login || !password || !deviceId) return res.json({ status: 'error', keys: [] }); const users = loadUsers(); const u = users[login]; if (!u || !verifyPassword(password, u).ok) return res.json({ status: 'error', keys: [] }); const tgLinks = loadTelegramLinks(); const vd = tgLinks.verifiedDevices[deviceId]; if (!vd || !vd.telegramId) return res.json({ status: 'ok', keys: [] }); if (!u.telegram || String(u.telegram.id) !== String(vd.telegramId)) return res.json({ status: 'ok', keys: [] }); const data = loadBotKeys(); const result = data.keys.filter(k => String(k.telegramId) === String(vd.telegramId) && !k.deleted).map(k => ({ key: k.key, status: getKeyStatus(k), maxDevices: 1, expiryDays: k.expiryDays || 1488, createdAt: k.createdAt, expiryAt: k.expiryAt, users: k.users || [], deactivatedAt: k.deactivatedAt || null, reason: k.reason || '' })); return res.json({ status: 'ok', keys: result }); });
 
-let server; // Объявляем переменную сервера для корректного закрытия
+// Вебхук для Telegram (для предотвращения задержек)
+app.post('/bot-webhook', (req, res) => {
+    // Если у тебя есть логика бота (Telegraf/node-telegram-bot-api), она должна обрабатываться здесь
+    // Например: bot.handleUpdate(req.body);
+    res.sendStatus(200);
+});
+
+let server;
 
 initDB().then(() => {
-    server = app.listen(PORT, '0.0.0.0', () => {
-        console.log(`ClumsyVPN auth server running on port ${PORT}`);
-        console.log(`  Telegram: ${telegramConfigured() ? 'ON' : 'OFF'}`);
-        console.log(`  DB: PostgreSQL connected`);
+    server = app.listen(PORT, '0.0.0.0', async () => {
+        console.log(`Сервер запущен на порту ${PORT}`);
+        console.log(`Telegram: ${telegramConfigured() ? 'ON' : 'OFF'}`);
+        
+        // Автоматическая привязка Webhook
+        if (telegramConfigured() && process.env.RENDER_EXTERNAL_URL) {
+            const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/bot-webhook`;
+            try {
+                await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
+                const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}`);
+                const tgData = await tgRes.json();
+                if (tgData.ok) console.log(`[TG] Webhook установлен на ${webhookUrl}`);
+                else console.error(`[TG] Ошибка Webhook:`, tgData.description);
+            } catch (e) { console.error(`[TG] Ошибка запроса Webhook:`, e.message); }
+        }
     });
 });
 
-// ФИКС EADDRINUSE: Корректное завершение по сигналу Render
+// Обработка завершения для Render (фикс EADDRINUSE)
 process.on('SIGTERM', () => {
-    console.log('SIGTERM received, closing server...');
+    console.log('SIGTERM получен, закрываем сервер...');
     if (server) {
         server.close(() => {
-            console.log('Server closed, process exiting.');
+            console.log('Сервер закрыт.');
             process.exit(0);
         });
     } else {
