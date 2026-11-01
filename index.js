@@ -3,7 +3,7 @@ const cors      = require('cors');
 const crypto    = require('crypto');
 const bcrypt    = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
-const { MongoClient } = require('mongodb');
+const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_LOGIN = 'admin';
