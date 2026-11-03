@@ -7,13 +7,18 @@ const bcrypt    = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  СЕКРЕТЫ — ТОЛЬКО ИЗ ENV. В КОДЕ ИХ НЕТ.
+//  СЕКРЕТЫ И НАСТРОЙКИ
 // ═══════════════════════════════════════════════════════════════════════════
 const PORT                       = process.env.PORT || 3000;
 const ADMIN_LOGIN                = 'admin';
 const ADMIN_PASSWORD             = process.env.ADMIN_PASSWORD || '';
-const LEGACY_ADMIN_PASSWORD_ON   = process.env.LEGACY_ADMIN_PASSWORD !== 'false';
 const ADMIN_ID                   = '#00000001';
+
+// Защита вебхука (Добавь эту переменную в Render Environment!)
+const TG_WEBHOOK_SECRET          = process.env.TG_WEBHOOK_SECRET || 'SuperSecretWebhookString123';
+
+// Папка для постоянного диска (если диск не настроен, пишет в корень)
+const DATA_DIR                   = process.env.DATA_DIR || __dirname;
 
 const TELEGRAM_BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN    || '';
 const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
@@ -22,41 +27,34 @@ const TELEGRAM_GROUP_LINK   = 'https://t.me/+Tu7sw6yGV_c5YzY6';
 const TELEGRAM_PURCHASE_CONTACT    = '@dsoci';
 const TELEGRAM_PRICE_TEXT          = '25 Stars или 50 грн';
 const TELEGRAM_TOKEN_TTL_MS        = 15 * 60 * 1000;
-const TELEGRAM_DISPLAY_TZ_OFFSET_MIN = process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN
-    ? parseInt(process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN, 10)
-    : 180;
+const TELEGRAM_DISPLAY_TZ_OFFSET_MIN = process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN ? parseInt(process.env.TELEGRAM_DISPLAY_TZ_OFFSET_MIN, 10) : 180;
 
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-// Hard-fail: без пароля админа сервер не стартует.
 if (!ADMIN_PASSWORD || ADMIN_PASSWORD.length < 16) {
     console.error('[FATAL] ADMIN_PASSWORD не задан или короче 16 символов.');
-    console.error('        Задайте его в env (Render → Environment → ADMIN_PASSWORD).');
     process.exit(1);
 }
 
-const DB_FILE          = path.join(__dirname, 'users.json');
-const STATE_FILE       = path.join(__dirname, 'app_state.json');
-const REPORTS_FILE     = path.join(__dirname, 'reports.json');
-const PERM_BANS_FILE   = path.join(__dirname, 'perm_bans.json');
-const RANK_POSTS_FILE  = path.join(__dirname, 'rank_posts.json');
-const RANK_MUTES_FILE  = path.join(__dirname, 'rank_mutes.json');
-const TELEGRAM_LINKS_FILE = path.join(__dirname, 'telegram_links.json');
-const CHAT_FILE        = path.join(__dirname, 'chat.json');
-const SUPPORT_FILE     = path.join(__dirname, 'support.json');
-const KEYS_FILE        = path.join(__dirname, 'keys.json');
-const DELETED_KEYS_FILE = path.join(__dirname, 'deleted_keys.json');
-const BOT_KEYS_FILE    = path.join(__dirname, 'bot_keys.json');
+// ═══════════════════════════════════════════════════════════════════════════
+//  ПУТИ К ФАЙЛАМ (Привязаны к DATA_DIR)
+// ═══════════════════════════════════════════════════════════════════════════
+const DB_FILE          = path.join(DATA_DIR, 'users.json');
+const STATE_FILE       = path.join(DATA_DIR, 'app_state.json');
+const REPORTS_FILE     = path.join(DATA_DIR, 'reports.json');
+const PERM_BANS_FILE   = path.join(DATA_DIR, 'perm_bans.json');
+const RANK_POSTS_FILE  = path.join(DATA_DIR, 'rank_posts.json');
+const RANK_MUTES_FILE  = path.join(DATA_DIR, 'rank_mutes.json');
+const TELEGRAM_LINKS_FILE = path.join(DATA_DIR, 'telegram_links.json');
+const CHAT_FILE        = path.join(DATA_DIR, 'chat.json');
+const SUPPORT_FILE     = path.join(DATA_DIR, 'support.json');
+const KEYS_FILE        = path.join(DATA_DIR, 'keys.json');
+const DELETED_KEYS_FILE = path.join(DATA_DIR, 'deleted_keys.json');
+const BOT_KEYS_FILE    = path.join(DATA_DIR, 'bot_keys.json');
 
 const app = express();
-
-// Фикс для express-rate-limit за прокси (Render)
 app.set('trust proxy', 1);
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CORS — только из env. Пусто = CORS выключен (мобильный клиент не нуждается).
-// ═══════════════════════════════════════════════════════════════════════════
 app.use(cors({
     origin: CORS_ORIGINS.length > 0 ? CORS_ORIGINS : false,
     credentials: false,
@@ -91,7 +89,7 @@ const rlSupportSend     = makeLimiter(1,   30,  '/support/send');
 const rlSupportCreate   = makeLimiter(60,   5,  '/support/create');
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  АТОМАРНАЯ ЗАПИСЬ (temp + rename) — защита от corruption при краше
+//  АТОМАРНАЯ ЗАПИСЬ
 // ═══════════════════════════════════════════════════════════════════════════
 function atomicWrite(filePath, data) {
     const tmp = filePath + '.tmp.' + process.pid + '.' + Date.now();
@@ -116,7 +114,6 @@ function esc(s) {
     }[c]));
 }
 
-// constant-time сравнение строк
 function safeEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     const bufA = Buffer.from(a, 'utf8');
@@ -130,7 +127,6 @@ function hashPassword(plain) {
     return bcrypt.hashSync(plain, 10);
 }
 
-// Проверка пароля с миграцией plaintext → bcrypt.
 function verifyPassword(plain, user) {
     if (!user || !plain) return { ok: false, migrated: false };
     if (user.passwordHash) {
@@ -144,7 +140,6 @@ function verifyPassword(plain, user) {
     return { ok: false, migrated: false };
 }
 
-// Lock для users.json — сериализует read-modify-write операции.
 let usersLock = Promise.resolve();
 function withUsersLock(fn) {
     const next = usersLock.then(fn, fn);
@@ -152,7 +147,6 @@ function withUsersLock(fn) {
     return next;
 }
 
-// Lock для keys.json
 let keysLock = Promise.resolve();
 function withKeysLock(fn) {
     const next = keysLock.then(fn, fn);
@@ -246,7 +240,6 @@ function isValidAdminSession(token) {
     if (s.expiresAt < Date.now()) { ADMIN_SESSIONS.delete(token); return false; }
     return true;
 }
-// Периодическая чистка протухших сессий
 setInterval(() => {
     const nowMs = Date.now();
     for (const [t, s] of ADMIN_SESSIONS.entries()) {
@@ -349,7 +342,6 @@ function cleanupExpiredTelegramTokens() {
 }
 setInterval(cleanupExpiredTelegramTokens, 60 * 60 * 1000);
 
-// Обработчики бота
 async function handleTelegramStart(message) {
     const chatId = message.chat.id;
     const from = message.from || {};
@@ -416,7 +408,6 @@ async function handleGetTokenAgain(message) {
     await handleTelegramCheckSub(message.chat.id, message.from || {});
 }
 
-// ── Бот-ключи ──────────────────────────────────────────────────────────────
 function getBotKeyStatus(k) {
     if (!k) return null;
     if (k.status === 'deactivated') return 'deactivated';
@@ -758,19 +749,13 @@ function deactivatedUserMessage(entry) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ADMIN MIDDLEWARE
+//  ADMIN MIDDLEWARE (СТРОГАЯ ПРОВЕРКА ТОЛЬКО ПО ТОКЕНУ)
 // ═══════════════════════════════════════════════════════════════════════════
 function requireAdmin(req, res, next) {
     const auth = (req.headers['authorization'] || '').trim();
     if (auth.startsWith('Bearer ')) {
         if (isValidAdminSession(auth.slice(7))) return next();
         return res.status(403).json({ status: 'forbidden', message: 'Недействительный или просроченный токен' });
-    }
-    if (LEGACY_ADMIN_PASSWORD_ON) {
-        const { adminLogin, adminPassword } = req.body || {};
-        if (adminLogin === ADMIN_LOGIN && typeof adminPassword === 'string' && safeEqual(adminPassword, ADMIN_PASSWORD)) {
-            return next();
-        }
     }
     return res.status(403).json({ status: 'forbidden', message: 'Нет доступа' });
 }
@@ -2232,6 +2217,12 @@ app.post('/admin/bot/keys/list', requireAdmin, (req, res) => {
 
 // Приемник вебхука от Telegram
 app.post('/bot-webhook', (req, res) => {
+    // 🔥 ЗАЩИТА ОТ ПОДДЕЛКИ: Проверяем секретный заголовок от Telegram
+    const secret = req.headers['x-telegram-bot-api-secret-token'];
+    if (secret !== TG_WEBHOOK_SECRET) {
+        console.warn('[TG] Отклонен фейковый вебхук!');
+        return res.sendStatus(403);
+    }
     handleTelegramUpdate(req.body);
     res.sendStatus(200);
 });
@@ -2244,21 +2235,19 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`ClumsyVPN auth server v3.0.0 running on port ${PORT}`);
+    console.log(`  Data directory: ${DATA_DIR}`);
     console.log(`  Telegram: ${telegramConfigured() ? 'ON' : 'OFF'}`);
     console.log(`  CORS: ${CORS_ORIGINS.length ? CORS_ORIGINS.join(',') : 'disabled'}`);
-    console.log(`  Legacy admin password path: ${LEGACY_ADMIN_PASSWORD_ON ? 'ENABLED (обновите клиент!)' : 'DISABLED'}`);
+    console.log(`  Legacy admin password path: DISABLED (теперь только Bearer Token!)`);
     
-    // Автоматическая привязка Webhook при старте
     if (telegramConfigured() && process.env.RENDER_EXTERNAL_URL) {
         const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/bot-webhook`;
         try {
-            // Удаляем старые зависшие обновления
             await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true`);
-            // Ставим новый вебхук
-            const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}`);
+            const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${webhookUrl}&secret_token=${TG_WEBHOOK_SECRET}`);
             const tgData = await tgRes.json();
             if (tgData.ok) {
-                console.log(`[TG] Webhook успешно установлен на ${webhookUrl}`);
+                console.log(`[TG] Webhook успешно установлен на ${webhookUrl} с секретным токеном.`);
             } else {
                 console.error(`[TG] Ошибка установки Webhook:`, tgData.description);
             }
